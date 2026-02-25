@@ -19,7 +19,7 @@ const pdfParse = require('pdf-parse');
 const app = express();
 app.use(cors());
 app.use((req, res, next) => { console.log(`[${new Date().toISOString().slice(11,19)}] ${req.method} ${req.url}`); next(); });
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '500mb' }));
 
 const DATA_DIR = process.env.DATA_DIR || './data';
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -512,7 +512,7 @@ async function uploadToSharePoint(folderPath, fileName, buffer) {
 app.get('/api/health', (req, res) => res.json({ status: 'ok', dryRun: process.env.DRY_RUN === 'true', hasVorlage: fs.existsSync(VORLAGE_FILE) }));
 
 // --- PDF Extraction Endpoint ---
-app.post('/api/extract', express.json({ limit: '50mb' }), async (req, res) => {
+app.post('/api/extract', express.json({ limit: '500mb' }), async (req, res) => {
   try {
     const { pdfBase64 } = req.body;
     if (!pdfBase64) return res.status(400).json({ error: 'pdfBase64 required' });
@@ -551,7 +551,7 @@ app.post('/api/vorlage', upload.single('vorlage'), (req, res) => {
 });
 
 // --- Pipeline Step 1: Generate PDF only (for preview before sending) ---
-app.post('/api/pipeline/generate', express.json({ limit: '100mb' }), async (req, res) => {
+app.post('/api/pipeline/generate', express.json({ limit: '500mb' }), async (req, res) => {
   console.log('📥 Pipeline generate - received JSON request');
   try {
     const { kundeName, gewerk, region, pdfs } = req.body;

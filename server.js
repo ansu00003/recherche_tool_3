@@ -104,7 +104,7 @@ const transporter = nodemailer.createTransport({
 });
 transporter.verify().then(() => console.log('✅ SMTP verified')).catch((e) => console.error('❌ SMTP:', e.message));
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB per file
 
 // ========================
 // VORLAGE FILE
@@ -550,29 +550,69 @@ app.post('/api/vorlage', upload.single('vorlage'), (req, res) => {
   res.json({ ok: true, size: req.file.size, name: req.file.originalname });
 });
 
-// --- Pipeline Step 1: Generate PDF only (for preview before sending) ---
-app.post('/api/pipeline/generate', express.json({ limit: '500mb' }), async (req, res) => {
-  console.log('📥 Pipeline generate - received JSON request');
+// --- Pipeline Step 1 (NEW): Generate DOCX from pre-extracted entries ---
+app.post('/api/pipeline/generate-docx', express.json({ limit: '50mb' }), async (req, res) => {
+  console.log('📥 Pipeline generate-docx - received pre-extracted entries');
   try {
-    const { kundeName, gewerk, region, pdfs } = req.body;
-    if (!pdfs?.length) return res.status(400).json({ error: 'No PDFs provided' });
+    const { kundeName, gewerk, region, entries } = req.body;
+    if (!entries?.length) return res.status(400).json({ error: 'No entries provided' });
     if (!fs.existsSync(VORLAGE_FILE)) return res.status(400).json({ error: 'Keine Vorlage hochgeladen.' });
 
-    const pdfNames = pdfs.map((f) => f.name);
-    console.log(`\n🔧 Generate started for "${kundeName}" (${pdfs.length} PDFs)`);
+    const pdfNames = entries.map((e) => e._filename || e.titel || 'PDF');
+    console.log(`\n🔧 Generate DOCX for "${kundeName}" (${entries.length} entries)`);
 
-    // 1. Extract data from PDFs (decode base64)
+    // 1. Generate DOCX
+    console.log('  📝 Generating DOCX...');
+    const baseName = `Recherche_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
+    const docxFilename = `${baseName}.docx`;
+    const pdfFilename = `${baseName}.pdf`;
+    const docxBuffer = await generateDocxBuffer(VORLAGE_FILE, entries, gewerk, region);
+
+    // 2. Convert DOCX → PDF
+    console.log('  📄 Converting DOCX → PDF...');
+    const pdfOutputBuffer = await convertDocxToPdf(docxBuffer, docxFilename);
+    if (pdfOutputBuffer) console.log(`  ✅ PDF generated: ${pdfFilename}`);
+    else console.log('  ⚠️  PDF conversion failed, will use DOCX');
+
+    // 3. Save to temp preview directory
+    const previewId = Date.now().toString(36) + Math.random().toString(36).substr(2, 6);
+    const previewDir = path.join(ATTACHMENTS_DIR, '_preview', previewId);
+    fs.mkdirSync(previewDir, { recursive: true });
+
+    const attachmentBuffer = pdfOutputBuffer || docxBuffer;
+    const attachmentName = pdfOutputBuffer ? pdfFilename : docxFilename;
+    fs.writeFileSync(path.join(previewDir, attachmentName), attachmentBuffer);
+    fs.writeFileSync(path.join(previewDir, docxFilename), docxBuffer);
+
+    // Save entries as metadata for the send step
+    fs.writeFileSync(path.join(previewDir, '_meta.json'), JSON.stringify({ entries, pdfNames, docxFilename, pdfFilename, attachmentName }));
+
+    console.log(`  ✅ Preview ready: ${previewId}/${attachmentName}`);
+    res.json({ ok: true, previewId, attachmentName, entries, pdfNames });
+  } catch (e) {
+    console.error('❌ Generate-docx error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Pipeline Step 1: Generate PDF only (for preview before sending) ---
+app.post('/api/pipeline/generate', upload.array('pdfs', 50), async (req, res) => {
+  console.log('📥 Pipeline generate - received multipart request');
+  try {
+    const { kundeName, gewerk, region } = req.body;
+    if (!req.files?.length) return res.status(400).json({ error: 'No PDFs provided' });
+    if (!fs.existsSync(VORLAGE_FILE)) return res.status(400).json({ error: 'Keine Vorlage hochgeladen.' });
+
+    const pdfNames = req.files.map((f) => f.originalname);
+    console.log(`\n🔧 Generate started for "${kundeName}" (${req.files.length} PDFs)`);
+
+    // 1. Extract data from PDFs (direct buffer from multer)
     console.log('  📄 Extracting PDF data...');
     const entries = [];
-    for (let i = 0; i < pdfs.length; i++) {
+    for (let i = 0; i < req.files.length; i++) {
       console.log(`    → ${pdfNames[i]}...`);
       try {
-        // Decode base64 to buffer
-        let base64Data = pdfs[i].data;
-        if (base64Data.includes(',')) base64Data = base64Data.split(',')[1];
-        const pdfBuffer = Buffer.from(base64Data, 'base64');
-
-        const data = await extractFromPdfBuffer(pdfBuffer);
+        const data = await extractFromPdfBuffer(req.files[i].buffer);
         entries.push(data);
         console.log(`    ✅ ID: ${data.dtad_id} | ${data.titel?.substring(0, 50)}`);
       } catch (err) {

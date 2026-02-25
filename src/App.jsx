@@ -38,39 +38,46 @@ const api = {
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
-  async generatePipeline(data) {
-    // Convert PDFs to base64 for reliable upload
-    const pdfsBase64 = await Promise.all(
-      data.pdfs.map(file => new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve({ name: file.name, data: reader.result });
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-      }))
-    );
+  async extractPdf(file) {
+    // Extract single PDF - convert to base64 and send to /api/extract
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+      reader.readAsDataURL(file);
+    });
     
-    const payload = {
-      kundeName: data.kundeName,
-      gewerk: data.gewerk,
-      region: data.region,
-      pdfs: pdfsBase64
-    };
+    const r = await fetch("/api/extract", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pdfBase64: base64 })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  },
+  async generatePipeline(data, onProgress) {
+    // Process PDFs one at a time (avoids payload size issues)
+    const entries = [];
+    for (let i = 0; i < data.pdfs.length; i++) {
+      const file = data.pdfs[i];
+      if (onProgress) onProgress(i + 1, data.pdfs.length, file.name);
+      try {
+        const extracted = await this.extractPdf(file);
+        entries.push({ ...extracted, _filename: file.name });
+      } catch (err) {
+        console.error(`Failed to extract ${file.name}:`, err);
+        entries.push({ titel: file.name, dtad_id: '—', abgabetermin: '—', ausfuehrungsort: '—', beginn: '—', ende: '—', leistung: '—', _filename: file.name });
+      }
+    }
     
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 180000);
-    try {
-      const r = await fetch("/api/pipeline/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
-      if (!r.ok) throw new Error(await r.text());
-      return r.json();
-    } catch (e) {
-      if (e.name === "AbortError") throw new Error("PDF-Generierung Timeout (3 Min). Bitte erneut versuchen.");
-      throw e;
-    } finally { clearTimeout(timeout); }
+    // Now generate DOCX with extracted data
+    const r = await fetch("/api/pipeline/generate-docx", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kundeName: data.kundeName, gewerk: data.gewerk, region: data.region, entries })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
   },
   async sendPipeline(data) {
     const r = await fetch("/api/pipeline/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
@@ -630,7 +637,10 @@ export default function App() {
       setPreviewPdfName(result.attachmentName);
       setPreviewPdfUrl(`/api/pipeline/preview/${result.previewId}/${encodeURIComponent(result.attachmentName)}`);
       setShowConfirm(true);
-    } catch (e) { showToast("Fehler beim Generieren", e.message, true); }
+    } catch (e) {
+      console.error('Pipeline generation error:', e);
+      showToast("Fehler beim Generieren", e.message || String(e), true);
+    }
     finally { setGenerating(false); }
   };
 

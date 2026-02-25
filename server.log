@@ -1,0 +1,9 @@
+
+🚀 KALKU Tender Tool v2 — http://localhost:3001
+   DRY_RUN: ❌ OFF | Pipedrive BCC: kalku@pipedrivemail.com
+🔐 Setting up SSH tunnel to anjali@91.98.185.113:9090...
+   Backend API: https://91.98.185.113:9090/users (via SSH tunnel)
+
+✅ SMTP verified
+SSH: channel 2: open failed: connect failed: Connection refused
+[14:48:07] GET /api/health

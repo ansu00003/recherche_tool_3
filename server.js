@@ -9,7 +9,7 @@ import fetch from 'node-fetch';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execSync, exec } from 'child_process';
+import { execSync, exec, spawn } from 'child_process';
 import { promisify } from 'util';
 const execAsync = promisify(exec);
 import { createRequire } from 'module';
@@ -988,8 +988,65 @@ app.post('/api/send-reminder', upload.array('pdfs', 5), async (req, res) => {
 // Static
 if (fs.existsSync('./dist')) { app.use(express.static('./dist')); app.get('*', (req, res) => res.sendFile(path.resolve('./dist/index.html'))); }
 
+// ========================
+// SSH TUNNEL FOR BACKEND API
+// ========================
+function setupSSHTunnel() {
+  const sshHost = '91.98.185.113';
+  const sshUser = 'anjali';
+  const sshPassword = 'U&!uwZ#FYv0gi8';
+  const remotePort = 9090;
+  const localPort = 9090;
+
+  console.log(`🔐 Setting up SSH tunnel to ${sshUser}@${sshHost}:${remotePort}...`);
+
+  // Use sshpass to provide password non-interactively
+  const sshCmd = spawn('sshpass', [
+    '-p', sshPassword,
+    'ssh',
+    '-o', 'StrictHostKeyChecking=no',
+    '-o', 'ServerAliveInterval=60',
+    '-L', `${localPort}:localhost:${remotePort}`,
+    '-N',
+    `${sshUser}@${sshHost}`
+  ]);
+
+  sshCmd.stdout.on('data', (data) => {
+    console.log(`SSH: ${data.toString().trim()}`);
+  });
+
+  sshCmd.stderr.on('data', (data) => {
+    const msg = data.toString().trim();
+    if (msg.includes('Allocated port') || msg.includes('Entering interactive session')) {
+      console.log(`✅ SSH tunnel established: localhost:${localPort} → ${sshHost}:${remotePort}`);
+    } else if (!msg.includes('Warning')) {
+      console.log(`SSH: ${msg}`);
+    }
+  });
+
+  sshCmd.on('error', (err) => {
+    console.error('❌ SSH tunnel error:', err.message);
+    console.error('   Make sure sshpass is installed: brew install hudochenkov/sshpass/sshpass');
+  });
+
+  sshCmd.on('close', (code) => {
+    console.log(`⚠️  SSH tunnel closed with code ${code}`);
+    if (code !== 0) {
+      console.log('   Retrying in 5 seconds...');
+      setTimeout(setupSSHTunnel, 5000);
+    }
+  });
+
+  return sshCmd;
+}
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`\n🚀 KALKU Tender Tool v2 — http://localhost:${PORT}`);
-  console.log(`   DRY_RUN: ${process.env.DRY_RUN === 'true' ? '✅ ON' : '❌ OFF'} | Pipedrive BCC: ${process.env.PIPEDRIVE_SMART_BCC}\n`);
+  console.log(`   DRY_RUN: ${process.env.DRY_RUN === 'true' ? '✅ ON' : '❌ OFF'} | Pipedrive BCC: ${process.env.PIPEDRIVE_SMART_BCC}`);
+  
+  // Setup SSH tunnel for backend API
+  setupSSHTunnel();
+  
+  console.log(`   Backend API: https://91.98.185.113:9090/users (via SSH tunnel)\n`);
 });

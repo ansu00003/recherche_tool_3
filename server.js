@@ -444,8 +444,16 @@ async function convertDocxToPdf(docxBuffer, outputFilename) {
     // Kill any hanging soffice processes first
     try { execSync('pkill -9 soffice', { timeout: 2000 }); } catch (e) { /* ignore */ }
 
+    // Detect LibreOffice path (macOS vs Linux)
+    let sofficePath = 'soffice'; // Default to PATH
+    if (fs.existsSync('/opt/homebrew/bin/soffice')) {
+      sofficePath = '/opt/homebrew/bin/soffice'; // macOS Homebrew
+    } else if (fs.existsSync('/usr/bin/soffice')) {
+      sofficePath = '/usr/bin/soffice'; // Linux
+    }
+
     // Run conversion async so we don't block the event loop
-    await execAsync(`/opt/homebrew/bin/soffice --headless --nofirststartwizard --nologo --norestore --convert-to pdf --outdir "${tmpDir}" "${docxPath}"`, {
+    await execAsync(`${sofficePath} --headless --nofirststartwizard --nologo --norestore --convert-to pdf --outdir "${tmpDir}" "${docxPath}"`, {
       timeout: 60000,
       env: { ...process.env, HOME: os.homedir() }
     });
@@ -992,6 +1000,14 @@ if (fs.existsSync('./dist')) { app.use(express.static('./dist')); app.get('*', (
 // SSH TUNNEL FOR BACKEND API
 // ========================
 function setupSSHTunnel() {
+  // Check if sshpass is available
+  try {
+    execSync('which sshpass', { stdio: 'ignore' });
+  } catch (e) {
+    console.log('⚠️  sshpass not installed, skipping SSH tunnel setup');
+    return null;
+  }
+
   const sshHost = '91.98.185.113';
   const sshUser = 'anjali';
   const sshPassword = 'U&!uwZ#FYv0gi8';

@@ -134,21 +134,39 @@ def extract_fields_from_text(text):
             break
     
     # --- AUSFUEHRUNGSORT ---
-    ort_patterns = [
-        r'Erfüllungsort[:\s]*\n?\s*([^\n]+)',
-        r'Ausführungsort[:\s]*\n?\s*([^\n]+)',
-        r'Leistungsort[:\s]*\n?\s*([^\n]+)',
-        r'Ort\s+der\s+Leistung[:\s]*\n?\s*([^\n]+)',
-        r'Region[:\s]*\n?\s*([^\n]+)',
-        r'PLZ[,\s]+Ort[:\s]*\n?\s*([^\n]+)',
-    ]
-    for pattern in ort_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            val = match.group(1).strip()
-            if len(val) > 3 and val != '—':
-                fields['ausfuehrungsort'] = val[:150]
-                break
+    # Step 1: Try multi-line Erfüllungsort pattern (captures address until stop-words)
+    erfuellungsort_pattern = r'Erfüllungsort[^:\n]*:\s*([^\n]+(?:\n(?!\s*(?:NUTS|Geschätzte|Zusätzliche|Hauptklassifizierung|CPV|Region|Postleitzahl|Verfahrensart|II\.|III\.|IV\.))[^\n]*)*?)(?=\n\s*(?:NUTS|Geschätzte|Zusätzliche|Hauptklassifizierung|CPV|Region|Postleitzahl|Verfahrensart|II\.|III\.|IV\.|$))'
+    match = re.search(erfuellungsort_pattern, text, re.IGNORECASE | re.DOTALL)
+    if match:
+        val = match.group(1).strip()
+        # Step 2: Join multi-line result with commas
+        lines = [l.strip() for l in val.split('\n') if l.strip()]
+        if lines:
+            fields['ausfuehrungsort'] = ', '.join(lines)[:300]
+    
+    # Step 3: Fallback patterns if Erfüllungsort not found
+    if fields['ausfuehrungsort'] == '—':
+        ort_patterns = [
+            r'Ausführungsort[^:\n]*:\s*([^\n]+)',
+            r'Leistungsort[:\s]*\n?\s*([^\n]+)',
+            r'Ort\s+der\s+(?:Leistungs)?ausführung[:\s]*\n?\s*([^\n]+)',
+            r'Hauptort\s+der\s+Ausführung[:\s]*\n?\s*([^\n]+)',
+        ]
+        for pattern in ort_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                val = match.group(1).strip()
+                if len(val) > 3 and val != '—' and not val.upper().startswith('NUTS'):
+                    fields['ausfuehrungsort'] = val[:150]
+                    break
+    
+    # Step 4: Final fallback to Region
+    if fields['ausfuehrungsort'] == '—':
+        region_match = re.search(r'Region[:\s]*([^\n]+)', text, re.IGNORECASE)
+        if region_match:
+            val = region_match.group(1).strip()
+            if len(val) > 2 and not val.upper().startswith('NUTS'):
+                fields['ausfuehrungsort'] = val[:100]
     
     # --- BEGINN / ENDE ---
     date_pattern_pairs = [
@@ -232,7 +250,12 @@ PDF TEXT (Auszug):
 AUFGABEN:
 1. Korrigiere falsche Feldwerte
 2. Fülle fehlende Daten (beginn/ende) durch Suche im Text
-3. Extrahiere vollständige Adressen für ausfuehrungsort (Straße + PLZ + Ort)
+3. WICHTIG FÜR "ausfuehrungsort":
+   - Extrahiere die VOLLSTÄNDIGE Adresse inklusive Straße, Hausnummer, PLZ und Ort
+   - Beispiel RICHTIG: "Gaußstr. 20, 42119 Wuppertal"
+   - Beispiel FALSCH: nur "42119 Wuppertal" (fehlt Straße)
+   - Wenn mehrere Zeilen: kombiniere sie zu einer vollständigen Adresse
+   - Ignoriere NUTS-Codes, CPV-Codes und andere Metadaten
 4. Formatiere leistung als saubere Stichpunkte (Zeilen mit - am Anfang)
 5. Entferne Metadaten wie "Kategorien:", CPV-Codes, etc.
 

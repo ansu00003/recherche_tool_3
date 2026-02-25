@@ -407,8 +407,15 @@ async function generateDocxBuffer(vorlagePath, entries, gewerk, region) {
     fs.writeFileSync(inputPath, JSON.stringify({ entries, gewerk: gewerk || '', region: region || '' }));
 
     console.log('    📝 Calling Python DOCX generator...');
+    
+    // Auto-detect Python: venv or system python3
+    let pythonCmd = 'python3';
+    if (fs.existsSync('./venv/bin/python3')) {
+      pythonCmd = './venv/bin/python3';
+    }
+    
     const { stdout, stderr } = await execAsync(
-      `python3 generate_docx.py "${vorlagePath}" "${outputPath}" < "${inputPath}"`,
+      `${pythonCmd} generate_docx.py "${vorlagePath}" "${outputPath}" < "${inputPath}"`,
       { cwd: process.cwd(), timeout: 30000, shell: true }
     );
     if (stderr) console.log('    ℹ️  generate_docx:', stderr.trim());

@@ -267,6 +267,7 @@ def extract_fields_from_text(text):
     
     # Also try to extract from KW (Kalenderwoche) patterns
     if fields['duration'] == '—':
+        # Pattern 1: KW X - KW Y on same line
         kw_match = re.search(r'KW\s*(\d+)(?:/\d+)?\s*[-–]\s*KW\s*(\d+)', text, re.IGNORECASE)
         if kw_match:
             start_kw = int(kw_match.group(1))
@@ -277,6 +278,22 @@ def extract_fields_from_text(text):
                     fields['duration'] = f"{weeks // 4} Monate"
                 else:
                     fields['duration'] = f"{weeks} Wochen"
+        
+        # Pattern 2: Separate lines - "Beginn der Ausführung: X. KW" and "Fertigstellung: Y. KW"
+        if fields['duration'] == '—':
+            beginn_kw_match = re.search(r'(?:Beginn\s+der\s+Ausführung|Ausführungsbeginn)[:\s]*(\d{1,2})\.?\s*KW\s*(\d{4})?', text, re.IGNORECASE)
+            ende_kw_match = re.search(r'(?:Fertigstellung|Ausführungsende)[:\s]*(\d{1,2})\.?\s*KW\s*(\d{4})?', text, re.IGNORECASE)
+            
+            if beginn_kw_match and ende_kw_match:
+                start_kw = int(beginn_kw_match.group(1))
+                end_kw = int(ende_kw_match.group(1))
+                weeks = end_kw - start_kw if end_kw > start_kw else (52 - start_kw + end_kw)
+                if weeks > 0:
+                    if weeks >= 48:
+                        fields['duration'] = f"{weeks // 4} Monate"
+                    else:
+                        fields['duration'] = f"{weeks} Wochen"
+                    print(f"Duration from KW: {start_kw} to {end_kw} = {weeks} weeks", file=sys.stderr)
     
     # --- LEISTUNG ---
     # Priority-based extraction - EXACT spec table
@@ -466,6 +483,17 @@ AUSSCHLÜSSE - ENTFERNE IMMER:
 - Zuschlagskriterien
 - Sicherheitsleistung
 - Bietergemeinschaft
+- Beginn der Ausführung (z.B. "Beginn der Ausführung: 18. KW 2026")
+- Fertigstellung (z.B. "Fertigstellung: 44. KW 2026")
+- Ablauf der Angebotsfrist (z.B. "Ablauf der Angebotsfrist am 19.03.2026")
+- KW-Angaben für Zeiträume
+- Sprache, in der die Angebote abgefasst sein müssen
+- Eröffnungstermin
+- Adresse für elektronische Angebote
+- URLs/Webseiten (z.B. www.vergabe.rib.de)
+- Submissionstermin
+- Zuschlagsfrist
+- Eignungskriterien
 
 ZEILENUMBRUCH-REGELN (KRITISCH):
 

@@ -15,7 +15,6 @@ const execAsync = promisify(exec);
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
-import PizZip from 'pizzip';
 
 const app = express();
 app.use(cors());
@@ -364,7 +363,7 @@ async function extractFromPdfBuffer(pdfBuffer) {
     // Call Python extractor
     const env = { ...process.env };
     const { stdout, stderr } = await execAsync(
-      `./venv/bin/python3 extract_pdf.py "${tempFile}"`,
+      `python3 extract_pdf.py "${tempFile}"`,
       { cwd: process.cwd(), env, timeout: 60000 }
     );
     
@@ -396,34 +395,34 @@ async function extractFromPdfBuffer(pdfBuffer) {
 }
 
 // ========================
-// DOCX GENERATION (ported from v2.1)
+// DOCX GENERATION (Python-based with python-docx/lxml)
 // ========================
-function generateDocxBuffer(vorlageBuffer, entries, gewerk, region) {
-  const zip = new PizZip(vorlageBuffer);
-  let docXml = zip.file('word/document.xml').asText();
+async function generateDocxBuffer(vorlagePath, entries, gewerk, region) {
+  const ts = Date.now();
+  const inputPath = path.join(LOCAL_TMP_DIR, `input_${ts}.json`);
+  const outputPath = path.join(LOCAL_TMP_DIR, `docx_${ts}.docx`);
 
-  const escapeXml = (t) => String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const replaceText = (xml, s, r) => xml.split(s).join(escapeXml(r));
+  try {
+    // Write input JSON to temp file (exec doesn't support stdin pipe)
+    fs.writeFileSync(inputPath, JSON.stringify({ entries, gewerk: gewerk || '', region: region || '' }));
 
-  if (gewerk) { docXml = replaceText(docXml, 'Gebäudereinigungsarbeiten', gewerk); docXml = replaceText(docXml, 'Gebäudereinigung', gewerk); }
-  if (region) { docXml = replaceText(docXml, '59759 Arnsberg + 50 km', region); docXml = replaceText(docXml, '47051 Duisburg + 50km', region); }
+    console.log('    📝 Calling Python DOCX generator...');
+    const { stdout, stderr } = await execAsync(
+      `python3 generate_docx.py "${vorlagePath}" "${outputPath}" < "${inputPath}"`,
+      { cwd: process.cwd(), timeout: 30000, shell: true }
+    );
+    if (stderr) console.log('    ℹ️  generate_docx:', stderr.trim());
 
-  let idx;
-  idx = 0; docXml = docXml.replace(/ID:[^<]*/g, () => `ID: ${escapeXml(entries[idx]?.dtad_id || '—')}` + (idx++, ''));
-  idx = 0; docXml = docXml.replace(/Abgabetermin:[^<]*/g, () => `Abgabetermin: ${escapeXml(entries[idx]?.abgabetermin || '—')}` + (idx++, ''));
-  idx = 0; docXml = docXml.replace(/Ausführungsort:[^<]*/g, () => `Ausführungsort: ${escapeXml(entries[idx]?.ausfuehrungsort || '—')}` + (idx++, ''));
-  idx = 0; docXml = docXml.replace(/Ausführungsfrist:[^<]*Beginn:[^<]*Ende:[^<]*/g, () => {
-    const e = entries[idx] || {}; idx++;
-    return `Ausführungsfrist: Beginn: ${escapeXml(e.beginn || '—')} - Ende: ${escapeXml(e.ende || '—')}`;
-  });
-  idx = 0; docXml = docXml.replace(/Art und Umfang der Leistung:[^<]*/g, () => {
-    const e = entries[idx] || {}; idx++;
-    const leistung = (e.leistung || '—').replace(/\n/g, ' ');
-    return `Art und Umfang der Leistung: ${escapeXml(leistung)}`;
-  });
+    const result = JSON.parse(stdout.trim());
+    if (result.error) throw new Error(result.error);
 
-  zip.file('word/document.xml', docXml);
-  return zip.generate({ type: 'nodebuffer', mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+    const buffer = fs.readFileSync(outputPath);
+    console.log(`    ✅ DOCX generated: ${(buffer.length / 1024).toFixed(1)} KB, ${entries.length} sections`);
+    return buffer;
+  } finally {
+    try { fs.unlinkSync(inputPath); } catch (e) { /* ignore */ }
+    try { fs.unlinkSync(outputPath); } catch (e) { /* ignore */ }
+  }
 }
 
 // ========================
@@ -552,7 +551,6 @@ app.post('/api/pipeline/generate', express.json({ limit: '100mb' }), async (req,
     if (!pdfs?.length) return res.status(400).json({ error: 'No PDFs provided' });
     if (!fs.existsSync(VORLAGE_FILE)) return res.status(400).json({ error: 'Keine Vorlage hochgeladen.' });
 
-    const vorlageBuffer = fs.readFileSync(VORLAGE_FILE);
     const pdfNames = pdfs.map((f) => f.name);
     console.log(`\n🔧 Generate started for "${kundeName}" (${pdfs.length} PDFs)`);
 
@@ -566,7 +564,7 @@ app.post('/api/pipeline/generate', express.json({ limit: '100mb' }), async (req,
         let base64Data = pdfs[i].data;
         if (base64Data.includes(',')) base64Data = base64Data.split(',')[1];
         const pdfBuffer = Buffer.from(base64Data, 'base64');
-        
+
         const data = await extractFromPdfBuffer(pdfBuffer);
         entries.push(data);
         console.log(`    ✅ ID: ${data.dtad_id} | ${data.titel?.substring(0, 50)}`);
@@ -581,8 +579,7 @@ app.post('/api/pipeline/generate', express.json({ limit: '100mb' }), async (req,
     const baseName = `Recherche_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
     const docxFilename = `${baseName}.docx`;
     const pdfFilename = `${baseName}.pdf`;
-    const docxBuffer = await Promise.resolve(generateDocxBuffer(vorlageBuffer, entries, gewerk, region));
-    if (!Buffer.isBuffer(docxBuffer)) throw new Error('DOCX generation failed: expected Buffer');
+    const docxBuffer = await generateDocxBuffer(VORLAGE_FILE, entries, gewerk, region);
 
     // 3. Convert DOCX → PDF
     console.log('  📄 Converting DOCX → PDF...');
@@ -730,7 +727,6 @@ app.post('/api/pipeline/run', upload.array('pdfs', 20), async (req, res) => {
     if (!req.files?.length) return res.status(400).json({ error: 'No PDFs uploaded' });
     if (!fs.existsSync(VORLAGE_FILE)) return res.status(400).json({ error: 'Keine Vorlage hochgeladen. Bitte zuerst eine DOCX-Vorlage hochladen.' });
 
-    const vorlageBuffer = fs.readFileSync(VORLAGE_FILE);
     const pdfNames = req.files.map((f) => f.originalname);
     console.log(`\n🚀 Pipeline started for "${kundeName}" (${req.files.length} PDFs)`);
 
@@ -754,8 +750,7 @@ app.post('/api/pipeline/run', upload.array('pdfs', 20), async (req, res) => {
     const baseName = `Recherche_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
     const docxFilename = `${baseName}.docx`;
     const pdfFilename = `${baseName}.pdf`;
-    const docxBuffer = await Promise.resolve(generateDocxBuffer(vorlageBuffer, entries, gewerk, region));
-    if (!Buffer.isBuffer(docxBuffer)) throw new Error('DOCX generation failed: expected Buffer');
+    const docxBuffer = await generateDocxBuffer(VORLAGE_FILE, entries, gewerk, region);
 
     // 3. Convert DOCX → PDF
     console.log('  📄 Converting DOCX → PDF...');

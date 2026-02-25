@@ -9,7 +9,9 @@ import fetch from 'node-fetch';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execSync } from 'child_process';
+import { execSync, exec } from 'child_process';
+import { promisify } from 'util';
+const execAsync = promisify(exec);
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse');
@@ -65,10 +67,23 @@ async function listSharePointFolders(subfolder) {
   const driveId = process.env.MS_DRIVE_ID;
   const bp = process.env.MS_BASE_FOLDER;
   const fp = bp ? `${bp}/${subfolder}` : subfolder;
-  const url = fp
+  let url = fp
     ? `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encodeURIComponent(fp)}:/children?$top=999&$filter=folder ne null`
     : `https://graph.microsoft.com/v1.0/drives/${driveId}/root/children?$top=999&$filter=folder ne null`;
-  return (await graphGet(url)).value?.map((i) => i.name) || [];
+  console.log(`  📂 Listing SharePoint: ${subfolder}...`);
+  const allFolders = [];
+  try {
+    while (url) {
+      const result = await graphGet(url);
+      if (result.value) allFolders.push(...result.value.map((i) => i.name));
+      url = result['@odata.nextLink'] || null;
+    }
+    console.log(`  ✅ Found ${allFolders.length} folders in ${subfolder}`);
+    return allFolders;
+  } catch (err) {
+    console.error(`  ❌ SharePoint listing failed for ${subfolder}:`, err.message);
+    return [];
+  }
 }
 
 function parseFolderName(raw) {
@@ -98,51 +113,168 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 
 const VORLAGE_FILE = path.join(DATA_DIR, 'vorlage.docx');
 
 // ========================
-// PDF EXTRACTION: pdf-parse → regex → Claude validation
+// PDF EXTRACTION: pdf-parse → normalize → regex → Claude validation
 // ========================
-function matchField(text, regex) {
-  const m = text.match(regex);
-  return m ? m[1].trim() : '—';
+
+// Normalize text: collapse excessive whitespace but preserve paragraph breaks
+function normalizeText(text) {
+  return text
+    .replace(/\r\n/g, '\n')           // Normalize line endings
+    .replace(/[ \t]+/g, ' ')          // Collapse horizontal whitespace
+    .replace(/ ?\n ?/g, '\n')         // Trim spaces around newlines
+    .replace(/\n{3,}/g, '\n\n')       // Max 2 consecutive newlines
+    .trim();
 }
 
-function extractFieldsFromText(text) {
-  const titel = matchField(text, /Titel:\s*([^\n]+)/i);
-  const dtad_id = matchField(text, /DTAD[- ]ID:\s*([^\n]+)/i);
-  const abgabetermin = matchField(text, /Frist Angebotsabgabe:\s*([^\n]+)/i);
+// Create a "flattened" version where soft line breaks become spaces (for multi-line field matching)
+function flattenText(text) {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/([^\n])\n([^\n])/g, '$1 $2')  // Single newlines → spaces
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+}
 
-  let ausfuehrungsort = matchField(text, /Erfüllungsort[^:\n]*:\s*([^\n]+)/i);
-  if (ausfuehrungsort === '—') ausfuehrungsort = matchField(text, /Region:\s*([^\n]+)/i);
+// Extract field with multiple pattern attempts
+function extractField(text, flatText, patterns, defaultVal = '—') {
+  for (const pattern of patterns) {
+    // Try on flattened text first (handles wrapped lines)
+    let m = flatText.match(pattern);
+    if (m?.[1]) return m[1].trim().substring(0, 500);
+    // Then try original text
+    m = text.match(pattern);
+    if (m?.[1]) return m[1].trim().substring(0, 500);
+  }
+  return defaultVal;
+}
 
+// Extract date with common German formats
+function extractDate(text, flatText, patterns) {
+  const dateRegex = /(\d{1,2})[./](\d{1,2})[./](\d{2,4})/;
+  for (const pattern of patterns) {
+    let m = flatText.match(pattern) || text.match(pattern);
+    if (m?.[1]) {
+      const dateMatch = m[1].match(dateRegex);
+      if (dateMatch) return dateMatch[0];
+      return m[1].trim();
+    }
+  }
+  return '—';
+}
+
+function extractFieldsFromText(rawText) {
+  const text = normalizeText(rawText);
+  const flatText = flattenText(rawText);
+
+  // === TITEL ===
+  const titel = extractField(text, flatText, [
+    /Titel:\s*(.+?)(?=\n(?:Beschreibung|Kennung|Verfahrensart|DTAD|Kategorien|$))/is,
+    /Titel:\s*([^\n]+)/i,
+    /Bekanntmachung[:\s]+(.+?)(?=\n\n)/is,
+    /Ausschreibung[:\s]+(.+?)(?=\n)/i,
+  ]);
+
+  // === DTAD-ID ===
+  const dtad_id = extractField(text, flatText, [
+    /DTAD[- ]?ID[:\s]*(\d{6,10})/i,
+    /Referenznummer[:\s]*(\d{6,10})/i,
+    /Aktenzeichen[:\s]*([A-Z0-9\-\/]+)/i,
+    /Interne Kennung[:\s]*([^\n]+)/i,
+  ]);
+
+  // === ABGABETERMIN ===
+  const abgabetermin = extractDate(text, flatText, [
+    /Frist\s*(?:für\s*(?:die\s*)?)?Angebotsabgabe[:\s]*([^\n]+)/i,
+    /Angebotsfrist[:\s]*([^\n]+)/i,
+    /Schlusstermin[:\s]*([^\n]+)/i,
+    /Abgabefrist[:\s]*([^\n]+)/i,
+    /Einreichungsfrist[:\s]*([^\n]+)/i,
+    /Angebote\s*(?:sind\s*)?(?:bis|einzureichen\s*bis)[:\s]*([^\n]+)/i,
+    /Ablauf\s*der\s*Frist[:\s]*([^\n]+)/i,
+  ]);
+
+  // === AUSFÜHRUNGSORT ===
+  let ausfuehrungsort = extractField(text, flatText, [
+    /Erfüllungsort[^:\n]*[:\s]*([^\n]+)/i,
+    /Ort\s*der\s*(?:Leistungs)?[Aa]usführung[:\s]*([^\n]+)/i,
+    /Ausführungsort[:\s]*([^\n]+)/i,
+    /Leistungsort[:\s]*([^\n]+)/i,
+    /NUTS[- ]?Code[:\s]*([A-Z0-9]+)[^\n]*([^\n]*)/i,
+    /Region[:\s]*([^\n]+)/i,
+    /Postleitzahl[:\s]*(\d{5})[^\n]*([^\n]*)/i,
+  ]);
+  // Clean up NUTS codes - extract city if present
+  if (ausfuehrungsort.match(/^DE[A-Z0-9]+$/)) {
+    const cityMatch = flatText.match(/(?:Ort|Stadt)[:\s]*([A-Za-zäöüÄÖÜß\s\-]+)/i);
+    if (cityMatch) ausfuehrungsort = cityMatch[1].trim();
+  }
+
+  // === BEGINN / ENDE ===
   let beginn = '—', ende = '—';
-  const datePatterns = [
-    [/Datum des Beginns:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i, /Enddatum der Laufzeit:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i],
-    [/\bBeginn:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i, /\bEnde:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i],
-    [/Ausführungsbeginn:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i, /Ausführungsende:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i],
-    [/Leistungsbeginn:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i, /Leistungsende:\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i],
-    [/\bab\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i, /\bbis\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i],
+  
+  // Pattern pairs for start/end dates
+  const datePairs = [
+    [/Datum\s*des\s*Beginns[:\s]*([^\n]+)/i, /Enddatum(?:\s*der\s*Laufzeit)?[:\s]*([^\n]+)/i],
+    [/Beginn\s*der\s*Ausführung[:\s]*([^\n]+)/i, /Ende\s*der\s*Ausführung[:\s]*([^\n]+)/i],
+    [/Ausführungsbeginn[:\s]*([^\n]+)/i, /Ausführungsende[:\s]*([^\n]+)/i],
+    [/Leistungsbeginn[:\s]*([^\n]+)/i, /Leistungsende[:\s]*([^\n]+)/i],
+    [/Vertragsbeginn[:\s]*([^\n]+)/i, /Vertragsende[:\s]*([^\n]+)/i],
+    [/Laufzeit\s*(?:ab|von)[:\s]*([^\n]+)/i, /Laufzeit\s*bis[:\s]*([^\n]+)/i],
+    [/\bab[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i, /\bbis[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i],
+    [/\bvom[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i, /\bbis[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/i],
   ];
 
-  for (const [bp, ep] of datePatterns) {
-    if (beginn === '—') { const m = text.match(bp); if (m) beginn = m[1].trim(); }
-    if (ende === '—') { const m = text.match(ep); if (m) ende = m[1].trim(); }
+  for (const [startP, endP] of datePairs) {
+    if (beginn === '—') beginn = extractDate(text, flatText, [startP]);
+    if (ende === '—') ende = extractDate(text, flatText, [endP]);
     if (beginn !== '—' && ende !== '—') break;
   }
 
+  // Try date range patterns
   if (beginn === '—' || ende === '—') {
     const rangePatterns = [
-      /Ausführungsfrist[^:]*:\s*Beginn:?\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*[-–]?\s*Ende:?\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/is,
+      /Ausführungsfrist[^:]*[:\s]*(?:Beginn[:\s]*)?(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*[-–bis]+\s*(?:Ende[:\s]*)?(\d{1,2}[./]\d{1,2}[./]\d{2,4})/is,
+      /Laufzeit[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*[-–bis]+\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/is,
+      /Zeitraum[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*[-–bis]+\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/is,
       /(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*[-–]\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})/,
     ];
     for (const p of rangePatterns) {
-      const m = text.match(p);
-      if (m) { if (beginn === '—') beginn = m[1].trim(); if (ende === '—') ende = m[2].trim(); break; }
+      const m = flatText.match(p) || text.match(p);
+      if (m) {
+        if (beginn === '—') beginn = m[1].trim();
+        if (ende === '—') ende = m[2].trim();
+        break;
+      }
     }
   }
 
+  // Try duration in months
+  if (beginn === '—' && ende === '—') {
+    const durationMatch = flatText.match(/Laufzeit[:\s]*(\d+)\s*Monat/i) || text.match(/Laufzeit[:\s]*(\d+)\s*Monat/i);
+    if (durationMatch) {
+      beginn = `${durationMatch[1]} Monate`;
+      ende = '—';
+    }
+  }
+
+  // === LEISTUNG ===
   let leistung = '—';
-  for (const p of [/Art und Umfang der Leistung:?\s*([\s\S]{10,3000})/i, /Kurzbeschreibung:?\s*([\s\S]{10,2000})/i, /Beschreibung:?\s*([\s\S]{10,2000})/i]) {
+  const leistungPatterns = [
+    /Art\s*und\s*Umfang\s*der\s*Leistung[:\s]*([\s\S]{20,}?)(?=\n(?:Kategorien|CPV|Vergabe|Erfüllungsort|Ausführ|Laufzeit|\d+\.\s|$))/i,
+    /Kurzbeschreibung[:\s]*([\s\S]{20,}?)(?=\n(?:Kategorien|CPV|Kennung|Verfahrensart|\d+\.\s|$))/i,
+    /Beschreibung[:\s]*([\s\S]{20,}?)(?=\n(?:Kategorien|CPV|Kennung|\d+\.\s|$))/i,
+    /Leistungsgegenstand[:\s]*([\s\S]{20,}?)(?=\n\n)/i,
+    /Gegenstand\s*des\s*Auftrags[:\s]*([\s\S]{20,}?)(?=\n\n)/i,
+  ];
+  for (const p of leistungPatterns) {
     const m = text.match(p);
-    if (m?.[1]) { leistung = m[1].trim().split(/\n\s*\n/)[0].substring(0, 2000); if (leistung.length > 10) break; }
+    if (m?.[1]) {
+      leistung = m[1].trim()
+        .split(/\n\s*\n/)[0]           // Take first paragraph
+        .replace(/\s+/g, ' ')          // Normalize whitespace
+        .substring(0, 2000);
+      if (leistung.length > 30) break;
+    }
   }
 
   return { titel, dtad_id, abgabetermin, ausfuehrungsort, beginn, ende, leistung };
@@ -155,25 +287,41 @@ async function validateWithAnthropic(fields, text) {
     return fields;
   }
 
+  // Only call Claude if we have missing fields
+  const missingFields = Object.entries(fields).filter(([k, v]) => v === '—').map(([k]) => k);
+  if (missingFields.length === 0) {
+    console.log('    ✅ All fields extracted, skipping Claude');
+    return fields;
+  }
+
   try {
-    console.log('    🤖 Calling Claude for field validation...');
+    console.log(`    🤖 Calling Claude for ${missingFields.length} missing fields: ${missingFields.join(', ')}`);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+    const timeout = setTimeout(() => controller.abort(), 15000);
     
     const prompt = `Du bist ein Datenextraktor für deutsche DTAD-Ausschreibungs-PDFs.
 
-Hier ist der PDF-Text:
-${text.slice(0, 8000)}
+Hier ist der PDF-Text (gekürzt):
+${text.slice(0, 10000)}
 
-Extrahierte Felder: ${JSON.stringify(fields)}
+Bereits extrahierte Felder: ${JSON.stringify(fields, null, 2)}
 
-Prüfe und korrigiere alle Felder. Wenn ein Feld "—" ist, versuche es aus dem Text zu extrahieren.
-Gib NUR ein JSON-Objekt zurück: titel, dtad_id, abgabetermin, ausfuehrungsort, beginn, ende, leistung`;
+Felder mit "—" konnten nicht extrahiert werden. Versuche diese aus dem Text zu finden.
+Behalte bereits extrahierte Werte bei, es sei denn sie sind offensichtlich falsch.
+
+Gib NUR ein valides JSON-Objekt zurück mit diesen Feldern:
+- titel: Titel der Ausschreibung
+- dtad_id: DTAD-ID oder Referenznummer (nur Zahlen/Buchstaben)
+- abgabetermin: Frist für Angebotsabgabe (Format: TT.MM.JJJJ)
+- ausfuehrungsort: Ort der Leistung (Stadt, PLZ oder Region)
+- beginn: Startdatum der Ausführung (Format: TT.MM.JJJJ)
+- ende: Enddatum der Ausführung (Format: TT.MM.JJJJ)
+- leistung: Kurze Beschreibung der Leistung (max 500 Zeichen)`;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2024-10-22' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 500, messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }] }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 800, messages: [{ role: 'user', content: prompt }] }),
       signal: controller.signal,
     });
     clearTimeout(timeout);
@@ -183,9 +331,22 @@ Gib NUR ein JSON-Objekt zurück: titel, dtad_id, abgabetermin, ausfuehrungsort, 
       console.log('    ⚠️  Claude API error:', data.error?.message || response.status);
       return fields;
     }
+    
     const textOut = (data.content || []).map((c) => (c.type === 'text' ? c.text : '')).join('');
-    console.log('    ✅ Claude validation complete');
-    return { ...fields, ...JSON.parse(textOut.replace(/```json|```/g, '').trim()) };
+    const jsonMatch = textOut.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      // Only update fields that were missing or are clearly better
+      const merged = { ...fields };
+      for (const [key, val] of Object.entries(parsed)) {
+        if (val && val !== '—' && (fields[key] === '—' || !fields[key])) {
+          merged[key] = String(val).trim();
+        }
+      }
+      console.log('    ✅ Claude validation complete');
+      return merged;
+    }
+    return fields;
   } catch (err) {
     console.log('    ⚠️  Claude validation skipped:', err.name === 'AbortError' ? 'timeout' : err.message);
     return fields;
@@ -193,18 +354,45 @@ Gib NUR ein JSON-Objekt zurück: titel, dtad_id, abgabetermin, ausfuehrungsort, 
 }
 
 async function extractFromPdfBuffer(pdfBuffer) {
-  console.log('    📄 Parsing PDF...');
-  // Step 1: pdf-parse extracts text
-  const result = await pdfParse(pdfBuffer);
-  const text = result.text || '';
-  console.log(`    ✅ PDF parsed (${text.length} chars)`);
-
-  // Step 2: regex first pass
-  const fieldsRaw = extractFieldsFromText(text);
-
-  // Step 3: Skip Claude validation for speed - just use regex results
-  // return validateWithAnthropic(fieldsRaw, text);
-  return fieldsRaw;
+  console.log('    📄 Extracting with Python/pdfplumber...');
+  
+  // Write buffer to temp file
+  const tempFile = path.join(DATA_DIR, '_tmp', `pdf_${Date.now()}.pdf`);
+  fs.writeFileSync(tempFile, pdfBuffer);
+  
+  try {
+    // Call Python extractor
+    const env = { ...process.env };
+    const { stdout, stderr } = await execAsync(
+      `./venv/bin/python3 extract_pdf.py "${tempFile}"`,
+      { cwd: process.cwd(), env, timeout: 60000 }
+    );
+    
+    if (stderr) console.log('    ⚠️  Python stderr:', stderr);
+    
+    const fields = JSON.parse(stdout.trim());
+    if (fields.error) {
+      throw new Error(fields.error);
+    }
+    
+    const missing = Object.values(fields).filter(v => v === '—').length;
+    console.log(`    ✅ Extracted ${7 - missing}/7 fields`);
+    return fields;
+  } catch (err) {
+    console.error('    ❌ Python extraction failed:', err.message);
+    // Fallback to Node.js pdf-parse
+    console.log('    🔄 Falling back to pdf-parse...');
+    const result = await pdfParse(pdfBuffer);
+    const text = result.text || '';
+    const fieldsRaw = extractFieldsFromText(text);
+    const missing = Object.values(fieldsRaw).filter(v => v === '—').length;
+    if (missing >= 3 && process.env.ANTHROPIC_API_KEY) {
+      return await validateWithAnthropic(fieldsRaw, text);
+    }
+    return fieldsRaw;
+  } finally {
+    try { fs.unlinkSync(tempFile); } catch(e) {}
+  }
 }
 
 // ========================
@@ -244,23 +432,24 @@ function generateDocxBuffer(vorlageBuffer, entries, gewerk, region) {
 const LOCAL_TMP_DIR = path.join(DATA_DIR, '_tmp');
 if (!fs.existsSync(LOCAL_TMP_DIR)) fs.mkdirSync(LOCAL_TMP_DIR, { recursive: true });
 
-function convertDocxToPdf(docxBuffer, outputFilename) {
+async function convertDocxToPdf(docxBuffer, outputFilename) {
   const tmpDir = fs.mkdtempSync(path.join(LOCAL_TMP_DIR, 'tender-'));
   const docxPath = path.join(tmpDir, outputFilename);
-  fs.writeFileSync(docxPath, docxBuffer);
 
   try {
+    // Ensure docxBuffer is resolved (not a Promise) before writing
+    const resolvedBuffer = await Promise.resolve(docxBuffer);
+    fs.writeFileSync(docxPath, resolvedBuffer);
     console.log(`  🔄 Converting with LibreOffice: ${docxPath}`);
     // Kill any hanging soffice processes first
     try { execSync('pkill -9 soffice', { timeout: 2000 }); } catch (e) { /* ignore */ }
-    
-    // Run conversion with increased timeout and explicit environment
-    execSync(`/opt/homebrew/bin/soffice --headless --nofirststartwizard --nologo --norestore --convert-to pdf --outdir "${tmpDir}" "${docxPath}"`, { 
+
+    // Run conversion async so we don't block the event loop
+    await execAsync(`/opt/homebrew/bin/soffice --headless --nofirststartwizard --nologo --norestore --convert-to pdf --outdir "${tmpDir}" "${docxPath}"`, {
       timeout: 60000,
-      stdio: 'pipe',
       env: { ...process.env, HOME: os.homedir() }
     });
-    
+
     const pdfPath = path.join(tmpDir, outputFilename.replace(/\.docx$/i, '.pdf'));
     if (fs.existsSync(pdfPath)) {
       const pdfBuffer = fs.readFileSync(pdfPath);
@@ -294,8 +483,11 @@ async function graphPut(url, buffer, contentType) {
 
 async function uploadToSharePoint(folderPath, fileName, buffer) {
   const driveId = process.env.MS_DRIVE_ID;
-  const filePath = `${folderPath}/${fileName}`;
-  const url = `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${encodeURIComponent(filePath)}:/content`;
+  // Encode each path segment separately, not the whole path (slashes must stay as-is)
+  const encodedPath = folderPath.split('/').map(encodeURIComponent).join('/');
+  const filePath = `${encodedPath}/${encodeURIComponent(fileName)}`;
+  const url = `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${filePath}:/content`;
+  console.log(`  📤 Uploading to SharePoint: ${folderPath}/${fileName}`);
   return graphPut(url, buffer);
 }
 
@@ -304,6 +496,30 @@ async function uploadToSharePoint(folderPath, fileName, buffer) {
 // ========================
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok', dryRun: process.env.DRY_RUN === 'true', hasVorlage: fs.existsSync(VORLAGE_FILE) }));
+
+// --- PDF Extraction Endpoint ---
+app.post('/api/extract', express.json({ limit: '50mb' }), async (req, res) => {
+  try {
+    const { pdfBase64 } = req.body;
+    if (!pdfBase64) return res.status(400).json({ error: 'pdfBase64 required' });
+    
+    console.log('📄 /api/extract - Processing PDF...');
+    
+    // Decode base64
+    let base64Data = pdfBase64;
+    if (base64Data.includes(',')) base64Data = base64Data.split(',')[1];
+    const pdfBuffer = Buffer.from(base64Data, 'base64');
+    
+    // Extract fields using Python/pdfplumber
+    const fields = await extractFromPdfBuffer(pdfBuffer);
+    
+    console.log('✅ /api/extract - Extraction complete');
+    res.json(fields);
+  } catch (err) {
+    console.error('❌ /api/extract error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // --- Vorlage Upload/Status ---
 app.get('/api/vorlage', (req, res) => {
@@ -321,24 +537,29 @@ app.post('/api/vorlage', upload.single('vorlage'), (req, res) => {
 });
 
 // --- Pipeline Step 1: Generate PDF only (for preview before sending) ---
-app.post('/api/pipeline/generate', upload.array('pdfs', 20), async (req, res) => {
-  process.stdout.write('\n📥 /api/pipeline/generate called\n');
+app.post('/api/pipeline/generate', express.json({ limit: '100mb' }), async (req, res) => {
+  console.log('📥 Pipeline generate - received JSON request');
   try {
-    const { kundeName, gewerk, region } = req.body;
-    if (!req.files?.length) return res.status(400).json({ error: 'No PDFs uploaded' });
+    const { kundeName, gewerk, region, pdfs } = req.body;
+    if (!pdfs?.length) return res.status(400).json({ error: 'No PDFs provided' });
     if (!fs.existsSync(VORLAGE_FILE)) return res.status(400).json({ error: 'Keine Vorlage hochgeladen.' });
 
     const vorlageBuffer = fs.readFileSync(VORLAGE_FILE);
-    const pdfNames = req.files.map((f) => f.originalname);
-    console.log(`\n🔧 Generate started for "${kundeName}" (${req.files.length} PDFs)`);
+    const pdfNames = pdfs.map((f) => f.name);
+    console.log(`\n🔧 Generate started for "${kundeName}" (${pdfs.length} PDFs)`);
 
-    // 1. Extract data from PDFs
+    // 1. Extract data from PDFs (decode base64)
     console.log('  📄 Extracting PDF data...');
     const entries = [];
-    for (let i = 0; i < req.files.length; i++) {
+    for (let i = 0; i < pdfs.length; i++) {
       console.log(`    → ${pdfNames[i]}...`);
       try {
-        const data = await extractFromPdfBuffer(req.files[i].buffer);
+        // Decode base64 to buffer
+        let base64Data = pdfs[i].data;
+        if (base64Data.includes(',')) base64Data = base64Data.split(',')[1];
+        const pdfBuffer = Buffer.from(base64Data, 'base64');
+        
+        const data = await extractFromPdfBuffer(pdfBuffer);
         entries.push(data);
         console.log(`    ✅ ID: ${data.dtad_id} | ${data.titel?.substring(0, 50)}`);
       } catch (err) {
@@ -352,11 +573,12 @@ app.post('/api/pipeline/generate', upload.array('pdfs', 20), async (req, res) =>
     const baseName = `Recherche_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
     const docxFilename = `${baseName}.docx`;
     const pdfFilename = `${baseName}.pdf`;
-    const docxBuffer = generateDocxBuffer(vorlageBuffer, entries, gewerk, region);
+    const docxBuffer = await Promise.resolve(generateDocxBuffer(vorlageBuffer, entries, gewerk, region));
+    if (!Buffer.isBuffer(docxBuffer)) throw new Error('DOCX generation failed: expected Buffer');
 
     // 3. Convert DOCX → PDF
     console.log('  📄 Converting DOCX → PDF...');
-    const pdfOutputBuffer = convertDocxToPdf(docxBuffer, docxFilename);
+    const pdfOutputBuffer = await convertDocxToPdf(docxBuffer, docxFilename);
     if (pdfOutputBuffer) console.log(`  ✅ PDF generated: ${pdfFilename}`);
     else console.log('  ⚠️  PDF conversion failed, will use DOCX');
 
@@ -524,11 +746,12 @@ app.post('/api/pipeline/run', upload.array('pdfs', 20), async (req, res) => {
     const baseName = `Recherche_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
     const docxFilename = `${baseName}.docx`;
     const pdfFilename = `${baseName}.pdf`;
-    const docxBuffer = generateDocxBuffer(vorlageBuffer, entries, gewerk, region);
+    const docxBuffer = await Promise.resolve(generateDocxBuffer(vorlageBuffer, entries, gewerk, region));
+    if (!Buffer.isBuffer(docxBuffer)) throw new Error('DOCX generation failed: expected Buffer');
 
     // 3. Convert DOCX → PDF
     console.log('  📄 Converting DOCX → PDF...');
-    const pdfOutputBuffer = convertDocxToPdf(docxBuffer, docxFilename);
+    const pdfOutputBuffer = await convertDocxToPdf(docxBuffer, docxFilename);
     if (pdfOutputBuffer) console.log(`  ✅ PDF generated: ${pdfFilename}`);
     else console.log('  ⚠️  PDF conversion failed, will send DOCX instead');
 

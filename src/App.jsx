@@ -39,11 +39,38 @@ const api = {
     return r.json();
   },
   async generatePipeline(data) {
-    const form = new FormData();
-    Object.entries(data).forEach(([k, v]) => { if (k === "pdfs") v.forEach((f) => form.append("pdfs", f)); else if (v) form.append(k, v); });
-    const r = await fetch("/api/pipeline/generate", { method: "POST", body: form });
-    if (!r.ok) throw new Error(await r.text());
-    return r.json();
+    // Convert PDFs to base64 for reliable upload
+    const pdfsBase64 = await Promise.all(
+      data.pdfs.map(file => new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve({ name: file.name, data: reader.result });
+        reader.onerror = reject;
+        reader.readAsDataURL(file);
+      }))
+    );
+    
+    const payload = {
+      kundeName: data.kundeName,
+      gewerk: data.gewerk,
+      region: data.region,
+      pdfs: pdfsBase64
+    };
+    
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 180000);
+    try {
+      const r = await fetch("/api/pipeline/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    } catch (e) {
+      if (e.name === "AbortError") throw new Error("PDF-Generierung Timeout (3 Min). Bitte erneut versuchen.");
+      throw e;
+    } finally { clearTimeout(timeout); }
   },
   async sendPipeline(data) {
     const r = await fetch("/api/pipeline/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });

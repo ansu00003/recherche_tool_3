@@ -19,6 +19,7 @@
     "node-fetch": "^3.3.2",
     "nodemailer": "^6.9.8",
     "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "^5.4.624",
     "pizzip": "^3.2.0"
   },
   "devDependencies": {

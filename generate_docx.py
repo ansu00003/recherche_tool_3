@@ -36,6 +36,29 @@ GERMAN_MONTHS = [
 ]
 
 
+def format_ausfuehrungsfrist(entry):
+    """Format Ausführungsfrist based on available data.
+    
+    Case 1: Both dates exist → "Ausführungsfrist: Beginn: DD.MM.YYYY - Ende: DD.MM.YYYY"
+    Case 2: No dates but duration → "Ausführungsfrist: Geschätzte Laufzeit - X Monate"
+    Case 3: No dates, no duration → "Ausführungsfrist: Siehe Vergabeunterlagen"
+    """
+    beginn = entry.get("beginn", DASH)
+    ende = entry.get("ende", DASH)
+    duration = entry.get("duration", DASH)
+    
+    if beginn == DASH and ende == DASH:
+        if duration != DASH:
+            # Case 2: No dates but duration exists
+            return f"Ausführungsfrist: Geschätzte Laufzeit - {duration}"
+        else:
+            # Case 3: No dates, no duration
+            return "Ausführungsfrist: Siehe Vergabeunterlagen"
+    else:
+        # Case 1: At least one date exists
+        return f"Ausführungsfrist: Beginn: {beginn} - Ende: {ende}"
+
+
 # ============================================================
 # XML HELPERS
 # ============================================================
@@ -166,7 +189,11 @@ def detect_sections(body):
 # ============================================================
 
 def fill_section(section, entry, section_num):
-    """Fill an existing template section with entry data."""
+    """Fill an existing template section with entry data.
+    
+    Adds keepNext to all content paragraphs (title through last bullet) to prevent
+    page breaks within an entry. Empty spacers between entries do NOT get keepNext.
+    """
     for p in section["paras"]:
         text = "".join(t.text or "" for t in p.findall(f".//{{{W}}}t")).strip()
 
@@ -178,6 +205,7 @@ def fill_section(section, entry, section_num):
                 ref_run = first_run[0]
                 clear_paragraph_text(p)
                 p.append(make_run_with_rpr(ref_run, f"{section_num}. {titel}"))
+            set_keep_next(p)  # Keep title with following content
 
         elif text.startswith("ID:"):
             first_run = p.findall(f"{{{W}}}r")
@@ -185,6 +213,7 @@ def fill_section(section, entry, section_num):
                 ref_run = first_run[0]
                 clear_paragraph_text(p)
                 p.append(make_run_with_rpr(ref_run, f"ID: {entry.get('dtad_id', DASH)}"))
+            set_keep_next(p)
 
         elif text.startswith("Abgabetermin:"):
             first_run = p.findall(f"{{{W}}}r")
@@ -192,6 +221,7 @@ def fill_section(section, entry, section_num):
                 ref_run = first_run[0]
                 clear_paragraph_text(p)
                 p.append(make_run_with_rpr(ref_run, f"Abgabetermin: {entry.get('abgabetermin', DASH)}"))
+            set_keep_next(p)
 
         elif text.startswith("Ausführungsort:"):
             first_run = p.findall(f"{{{W}}}r")
@@ -199,25 +229,25 @@ def fill_section(section, entry, section_num):
                 ref_run = first_run[0]
                 clear_paragraph_text(p)
                 p.append(make_run_with_rpr(ref_run, f"Ausführungsort: {entry.get('ausfuehrungsort', DASH)}"))
+            set_keep_next(p)
 
         elif text.startswith("Ausführungsfrist:"):
             first_run = p.findall(f"{{{W}}}r")
             if first_run:
                 ref_run = first_run[0]
                 clear_paragraph_text(p)
-                beginn = entry.get("beginn", DASH)
-                ende = entry.get("ende", DASH)
-                p.append(make_run_with_rpr(
-                    ref_run,
-                    f"Ausführungsfrist: Beginn: {beginn} - Ende: {ende}"
-                ))
+                p.append(make_run_with_rpr(ref_run, format_ausfuehrungsfrist(entry)))
+            set_keep_next(p)
 
         elif text.startswith("Art und Umfang der Leistung:"):
             fill_leistung(p, entry, section)
 
 
 def fill_leistung(heading_p, entry, section):
-    """Fill the 'Art und Umfang der Leistung' field with bullet points."""
+    """Fill the 'Art und Umfang der Leistung' field with bullet points.
+    
+    All paragraphs (heading + bullets except last) get keepNext to keep entry together.
+    """
     leistung = entry.get("leistung", DASH)
     if not leistung or leistung == DASH:
         return
@@ -257,16 +287,22 @@ def fill_leistung(heading_p, entry, section):
     heading_ppr = heading_p.find(f"{{{W}}}pPr")
 
     # Insert each bullet as its own paragraph
-    for line in lines:
+    # All bullets except the last one get keepNext
+    for idx, line in enumerate(lines):
         bullet_text = line if line.startswith("- ") else f"- {line}"
         new_p = make_paragraph(heading_ppr)
 
-        # Remove keepNext from bullet paragraphs
+        # Clear any inherited keepNext first
         new_ppr = new_p.find(f"{{{W}}}pPr")
         if new_ppr is not None:
             kn = new_ppr.find(f"{{{W}}}keepNext")
             if kn is not None:
                 new_ppr.remove(kn)
+
+        # Add keepNext to all bullets EXCEPT the last one
+        # (last bullet doesn't need to keep with anything - allows page break after entry)
+        if idx < len(lines) - 1:
+            set_keep_next(new_p)
 
         # Add hanging indent for bullets
         set_hanging_indent(new_p)
@@ -277,6 +313,16 @@ def fill_leistung(heading_p, entry, section):
         # Insert after the previous element
         insert_after.addnext(new_p)
         insert_after = new_p
+    
+    # ADD: Empty spacer paragraph AFTER the last bullet (gap before next entry)
+    spacer_after_bullets = make_paragraph(heading_ppr)
+    # Clear any inherited keepNext from spacer
+    spacer_ppr = spacer_after_bullets.find(f"{{{W}}}pPr")
+    if spacer_ppr is not None:
+        kn = spacer_ppr.find(f"{{{W}}}keepNext")
+        if kn is not None:
+            spacer_ppr.remove(kn)
+    insert_after.addnext(spacer_after_bullets)
 
 
 def split_leistung_to_bullets(leistung):
@@ -284,16 +330,18 @@ def split_leistung_to_bullets(leistung):
     if not leistung or leistung == DASH:
         return []
 
-    # If already has bullet points (- prefix), split on those
-    if "- " in leistung:
-        lines = re.split(r"\s*-\s+", leistung)
-        lines = [l.strip() for l in lines if l.strip()]
-        return lines
-
-    # Split on newlines
+    # Split on NEWLINES first (each line is a bullet)
     lines = [l.strip() for l in leistung.split("\n") if l.strip()]
-    if len(lines) > 1:
-        return lines
+    
+    # Remove leading "- " from each line if present
+    result = []
+    for line in lines:
+        if line.startswith("- "):
+            result.append(line[2:].strip())
+        else:
+            result.append(line.strip())
+    
+    return [r for r in result if r]
 
     # Single block of text — split on sentences or semicolons
     parts = re.split(r"[;]\s*", leistung)
@@ -379,71 +427,85 @@ def create_extra_sections(body, sections, entries, num_existing):
         section_num = i + 1
         new_paras = []
 
-        # Empty spacer paragraph
-        spacer1 = make_paragraph(normal_ppr)
-        new_paras.append(spacer1)
+        # 1. Empty paragraph BEFORE the title
+        spacer_before_title = make_paragraph(normal_ppr)
+        new_paras.append(spacer_before_title)
 
-        # Title line (bold)
+        # Title line (bold) - keepNext to stay with following content
         titel = entry.get("titel", DASH)
         title_p = make_paragraph(normal_ppr)
         if bold_ref is not None:
             title_p.append(make_run_with_rpr(bold_ref, f"{section_num}. {titel}"))
         else:
             title_p.append(make_run(f"{section_num}. {titel}", bold=True))
+        set_keep_next(title_p)
         new_paras.append(title_p)
 
-        # ID line
+        # ID line - keepNext
         id_p = make_paragraph(normal_ppr)
         id_p.append(make_run_with_rpr(normal_ref, f"ID: {entry.get('dtad_id', DASH)}"))
+        set_keep_next(id_p)
         new_paras.append(id_p)
 
-        # Abgabetermin
+        # Abgabetermin - keepNext
         abgabe_p = make_paragraph(normal_ppr)
         abgabe_p.append(make_run_with_rpr(normal_ref, f"Abgabetermin: {entry.get('abgabetermin', DASH)}"))
+        set_keep_next(abgabe_p)
         new_paras.append(abgabe_p)
 
-        # Ausführungsort
+        # Ausführungsort - keepNext
         ort_p = make_paragraph(normal_ppr)
         ort_p.append(make_run_with_rpr(normal_ref, f"Ausführungsort: {entry.get('ausfuehrungsort', DASH)}"))
+        set_keep_next(ort_p)
         new_paras.append(ort_p)
 
-        # Ausführungsfrist
+        # Ausführungsfrist - keepNext
         frist_p = make_paragraph(normal_ppr)
-        beginn = entry.get("beginn", DASH)
-        ende = entry.get("ende", DASH)
-        frist_p.append(make_run_with_rpr(normal_ref, f"Ausführungsfrist: Beginn: {beginn} - Ende: {ende}"))
+        frist_p.append(make_run_with_rpr(normal_ref, format_ausfuehrungsfrist(entry)))
+        set_keep_next(frist_p)
         new_paras.append(frist_p)
 
-        # Empty spacer before Leistung
-        spacer2 = make_paragraph(normal_ppr)
-        new_paras.append(spacer2)
+        # 2. Empty paragraph BEFORE "Art und Umfang der Leistung" - keepNext (part of entry)
+        spacer_before_leistung = make_paragraph(normal_ppr)
+        set_keep_next(spacer_before_leistung)
+        new_paras.append(spacer_before_leistung)
 
-        # Art und Umfang der Leistung heading
+        # Art und Umfang der Leistung heading - keepNext
         leistung_heading = make_paragraph(normal_ppr)
         set_keep_next(leistung_heading)
         leistung_heading.append(make_run_with_rpr(normal_ref, "Art und Umfang der Leistung:"))
         new_paras.append(leistung_heading)
 
-        # Leistung bullet points
+        # Leistung bullet points - all except last get keepNext
         leistung = entry.get("leistung", DASH)
         lines = split_leistung_to_bullets(leistung)
         if lines:
-            for line in lines:
+            for idx, line in enumerate(lines):
                 bullet_text = line if line.startswith("- ") else f"- {line}"
                 bullet_p = make_paragraph(normal_ppr)
-                # Remove keepNext from bullets
+                # Clear any inherited keepNext
                 bullet_ppr = bullet_p.find(f"{{{W}}}pPr")
                 if bullet_ppr is not None:
                     kn = bullet_ppr.find(f"{{{W}}}keepNext")
                     if kn is not None:
                         bullet_ppr.remove(kn)
+                # Add keepNext to all bullets EXCEPT the last one
+                if idx < len(lines) - 1:
+                    set_keep_next(bullet_p)
                 set_hanging_indent(bullet_p)
                 bullet_p.append(make_run_with_rpr(normal_ref, bullet_text))
                 new_paras.append(bullet_p)
 
-        # Trailing spacer
-        spacer3 = make_paragraph(normal_ppr)
-        new_paras.append(spacer3)
+        # 3. ALWAYS add spacer after bullets (gap before next entry)
+        # This ensures proper spacing between entries
+        spacer_after_bullets = make_paragraph(normal_ppr)
+        # Clear any inherited keepNext from spacer (allows page break between entries)
+        spacer_ppr = spacer_after_bullets.find(f"{{{W}}}pPr")
+        if spacer_ppr is not None:
+            kn = spacer_ppr.find(f"{{{W}}}keepNext")
+            if kn is not None:
+                spacer_ppr.remove(kn)
+        new_paras.append(spacer_after_bullets)
 
         # Insert all new paragraphs into the document body
         for np in new_paras:

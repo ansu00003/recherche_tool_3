@@ -1,4 +1,6 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import * as pdfjsLib from "pdfjs-dist";
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).href;
 
 // ========================
 // API
@@ -38,35 +40,28 @@ const api = {
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
-  async extractPdf(file) {
-    // Extract single PDF - convert to base64 and send to /api/extract
-    const base64 = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
-      reader.readAsDataURL(file);
-    });
-    
+  async extractPdf(pdfObj) {
+    // pdfObj has { name, data (base64), size } - data already read
     const r = await fetch("/api/extract", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pdfBase64: base64 })
+      body: JSON.stringify({ pdfBase64: pdfObj.data })
     });
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
   async generatePipeline(data, onProgress) {
-    // Process PDFs one at a time (avoids payload size issues)
+    // Process PDFs one at a time (data already contains base64)
     const entries = [];
     for (let i = 0; i < data.pdfs.length; i++) {
-      const file = data.pdfs[i];
-      if (onProgress) onProgress(i + 1, data.pdfs.length, file.name);
+      const pdfObj = data.pdfs[i];
+      if (onProgress) onProgress(i + 1, data.pdfs.length, pdfObj.name);
       try {
-        const extracted = await this.extractPdf(file);
-        entries.push({ ...extracted, _filename: file.name });
+        const extracted = await this.extractPdf(pdfObj);
+        entries.push({ ...extracted, _filename: pdfObj.name });
       } catch (err) {
-        console.error(`Failed to extract ${file.name}:`, err);
-        entries.push({ titel: file.name, dtad_id: '—', abgabetermin: '—', ausfuehrungsort: '—', beginn: '—', ende: '—', leistung: '—', _filename: file.name });
+        console.error(`Failed to extract ${pdfObj.name}:`, err);
+        entries.push({ titel: pdfObj.name, dtad_id: '—', abgabetermin: '—', ausfuehrungsort: '—', beginn: '—', ende: '—', leistung: '—', _filename: pdfObj.name });
       }
     }
     
@@ -212,8 +207,62 @@ function KundenDropdown({ kunden, value, onChange, loading, onRefresh }) {
 // ========================
 // CONFIRM MODAL
 // ========================
+function PdfCanvasViewer({ url }) {
+  const containerRef = useRef(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (!url) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    (async () => {
+      try {
+        const resp = await fetch(url);
+        const data = await resp.arrayBuffer();
+        if (cancelled) return;
+        const pdf = await pdfjsLib.getDocument({ data }).promise;
+        if (cancelled) return;
+        const container = containerRef.current;
+        if (!container) return;
+        container.innerHTML = '';
+        const scale = 1.5;
+        for (let i = 1; i <= pdf.numPages; i++) {
+          const page = await pdf.getPage(i);
+          const viewport = page.getViewport({ scale });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          canvas.style.width = '100%';
+          canvas.style.height = 'auto';
+          canvas.style.display = 'block';
+          if (i > 1) canvas.style.borderTop = '1px solid #e2e8f0';
+          container.appendChild(canvas);
+          await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        }
+        setLoading(false);
+      } catch (err) {
+        if (!cancelled) { setError(err.message); setLoading(false); }
+      }
+    })();
+
+    return () => { cancelled = true; };
+  }, [url]);
+
+  return (
+    <div style={{ position: 'relative', background: '#f1f5f9' }}>
+      {loading && <div style={{ padding: 40, textAlign: 'center', color: '#64748b' }}>PDF wird gerendert...</div>}
+      {error && <div style={{ padding: 40, textAlign: 'center', color: '#ef4444' }}>Fehler: {error}</div>}
+      <div ref={containerRef} style={{ maxHeight: 500, overflowY: 'auto' }} />
+    </div>
+  );
+}
+
 function ConfirmModal({ open, data, onConfirm, onCancel, sending, title, pdfPreviewUrl, pdfPreviewName, sendLabel }) {
-  const [showPdf, setShowPdf] = useState(false);
+  const [showPdf, setShowPdf] = useState(true);
+
   if (!open) return null;
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", backdropFilter: "blur(4px)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", animation: "fadeIn .2s" }}>
@@ -239,7 +288,15 @@ function ConfirmModal({ open, data, onConfirm, onCancel, sending, title, pdfPrev
                 </button>
               </div>
               {showPdf && (
-                <iframe src={pdfPreviewUrl} style={{ width: "100%", height: 400, border: "none", background: "#f1f5f9" }} title="PDF Vorschau" />
+                <div style={{ position: "relative" }}>
+                  <PdfCanvasViewer url={pdfPreviewUrl} />
+                  <div style={{ position: "absolute", bottom: 10, right: 10 }}>
+                    <a href={pdfPreviewUrl} target="_blank" rel="noopener noreferrer"
+                       style={{ background: "#2563eb", color: "#fff", padding: "8px 16px", borderRadius: 8, fontSize: 12, fontWeight: 600, textDecoration: "none", display: "flex", alignItems: "center", gap: 6 }}>
+                      <I.Eye /> In neuem Tab öffnen
+                    </a>
+                  </div>
+                </div>
               )}
             </div>
           )}
@@ -621,7 +678,56 @@ export default function App() {
     finally { setVorlageUploading(false); }
   };
 
-  const handleDrop = (e) => { e.preventDefault(); setPdfs((p) => [...p, ...Array.from(e.dataTransfer.files).filter((f) => f.type === "application/pdf")]); };
+  const handleDrop = async (e) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files).filter((f) => f.type === "application/pdf");
+    await addPdfFiles(files);
+  };
+  
+  // Read files immediately to avoid stale File object references
+  const addPdfFiles = async (files) => {
+    for (const file of files) {
+      try {
+        console.log(`Reading file: ${file.name}, size: ${file.size}, type: ${file.type}`);
+        
+        // Check if file is valid
+        if (!file || file.size === 0) {
+          throw new Error(`File is empty or invalid: ${file?.name}`);
+        }
+        
+        const data = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            console.log(`Successfully read ${file.name}: ${reader.result?.length} chars`);
+            resolve(reader.result);
+          };
+          reader.onerror = (e) => {
+            console.error('FileReader error details:', {
+              error: reader.error,
+              errorName: reader.error?.name,
+              errorMessage: reader.error?.message,
+              readyState: reader.readyState,
+              fileName: file.name
+            });
+            reject(new Error(`FileReader failed: ${reader.error?.message || 'unknown error'}`));
+          };
+          reader.onabort = () => reject(new Error('File read was aborted'));
+          
+          // Try reading
+          try {
+            reader.readAsDataURL(file);
+          } catch (readErr) {
+            reject(new Error(`Cannot start reading: ${readErr.message}`));
+          }
+        });
+        
+        setPdfs((p) => [...p, { name: file.name, data, size: file.size }]);
+      } catch (err) {
+        console.error(`Failed to read ${file.name}:`, err);
+        showToast('Fehler beim Lesen', `${file.name}: ${err.message}`, true);
+      }
+    }
+  };
   const handleEmailBlur = () => { if (kunde && kundeEmail.trim()) api.saveEmail(kunde.raw, kundeEmail, empfaengerName.trim() || undefined); };
   const handleNameBlur = () => { if (kunde && empfaengerName.trim()) api.saveEmail(kunde.raw, kundeEmail.trim() || undefined, empfaengerName); };
 
@@ -761,7 +867,7 @@ export default function App() {
               <div style={{ background: "#fff", borderRadius: 16, padding: 20, border: "1px solid #e8edf5", boxShadow: "0 2px 12px rgba(0,0,0,.04)" }}>
                 <h2 style={{ margin: "0 0 14px", fontSize: 14, fontWeight: 700, display: "flex", alignItems: "center", gap: 8 }}><I.File /> PDFs</h2>
                 <div onDrop={handleDrop} onDragOver={(e) => e.preventDefault()} onClick={() => fileRef.current?.click()} style={{ border: "2px dashed #cbd5e1", borderRadius: 12, padding: pdfs.length ? "12px" : "28px", textAlign: "center", cursor: "pointer", background: "#fafbff" }}>
-                  <input ref={fileRef} type="file" accept=".pdf" multiple onChange={(e) => setPdfs((p) => [...p, ...Array.from(e.target.files).filter((f) => f.type === "application/pdf")])} style={{ display: "none" }} />
+                  <input ref={fileRef} type="file" accept=".pdf" multiple onChange={(e) => { addPdfFiles(Array.from(e.target.files).filter((f) => f.type === "application/pdf")); e.target.value = ''; }} style={{ display: "none" }} />
                   {!pdfs.length ? <><div style={{ color: "#94a3b8" }}><I.Upload /></div><p style={{ margin: "6px 0 0", color: "#64748b", fontSize: 13 }}>PDFs hierher ziehen</p></> :
                     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>{pdfs.map((f, i) => (<div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", background: "#fff", borderRadius: 8, border: "1px solid #e2e8f0", textAlign: "left" }} onClick={(e) => e.stopPropagation()}><I.File /><span style={{ flex: 1, fontSize: 12, fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</span><span onClick={(e) => { e.stopPropagation(); setPdfs((p) => p.filter((_, j) => j !== i)); }} style={{ cursor: "pointer", color: "#ef4444" }}><I.Trash /></span></div>))}</div>}
                 </div>

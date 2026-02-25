@@ -359,11 +359,17 @@ async function extractFromPdfBuffer(pdfBuffer) {
   const tempFile = path.join(DATA_DIR, '_tmp', `pdf_${Date.now()}.pdf`);
   fs.writeFileSync(tempFile, pdfBuffer);
   
+  // Auto-detect Python: venv or system python3
+  let pythonCmd = 'python3';
+  if (fs.existsSync('./venv/bin/python3')) {
+    pythonCmd = './venv/bin/python3';
+  }
+  
   try {
     // Call Python extractor
     const env = { ...process.env };
     const { stdout, stderr } = await execAsync(
-      `python3 extract_pdf.py "${tempFile}"`,
+      `${pythonCmd} extract_pdf.py "${tempFile}"`,
       { cwd: process.cwd(), env, timeout: 60000 }
     );
     
@@ -659,12 +665,47 @@ app.post('/api/pipeline/generate', upload.array('pdfs', 50), async (req, res) =>
 app.get('/api/pipeline/preview/:previewId/:filename', (req, res) => {
   const { previewId, filename } = req.params;
   const filePath = path.join(ATTACHMENTS_DIR, '_preview', previewId, filename);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Preview not found' });
+  
+  console.log(`📄 Preview request: ${previewId}/${filename}`);
+  console.log(`   Full path: ${filePath}`);
+  
+  if (!fs.existsSync(filePath)) {
+    console.error(`   ❌ File not found: ${filePath}`);
+    // List what's in the preview directory
+    const previewDir = path.join(ATTACHMENTS_DIR, '_preview', previewId);
+    if (fs.existsSync(previewDir)) {
+      console.log(`   📁 Contents of ${previewDir}:`, fs.readdirSync(previewDir));
+    } else {
+      console.log(`   📁 Preview directory doesn't exist: ${previewDir}`);
+    }
+    return res.status(404).json({ error: 'Preview not found', path: filePath });
+  }
+  
+  // Get file size for Content-Length header
+  const stat = fs.statSync(filePath);
+  console.log(`   ✅ File found: ${(stat.size / 1024).toFixed(1)} KB`);
+  
   const ext = path.extname(filename).toLowerCase();
   const ct = ext === '.pdf' ? 'application/pdf' : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+  
+  // Set headers for inline PDF viewing
   res.setHeader('Content-Type', ct);
+  res.setHeader('Content-Length', stat.size);
   res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
-  fs.createReadStream(filePath).pipe(res);
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Cache-Control', 'no-cache');
+  // Remove headers that might block PDF rendering
+  res.removeHeader('X-Content-Type-Options');
+  res.removeHeader('Content-Security-Policy');
+  
+  const stream = fs.createReadStream(filePath);
+  stream.on('error', (err) => {
+    console.error(`   ❌ Read stream error: ${err.message}`);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to read file', message: err.message });
+    }
+  });
+  stream.pipe(res);
 });
 
 // --- Pipeline Step 2: Send the pre-generated email ---

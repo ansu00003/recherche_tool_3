@@ -514,6 +514,75 @@ def create_extra_sections(body, sections, entries, num_existing):
 
 
 # ============================================================
+# SPACING NORMALIZATION
+# ============================================================
+
+def normalize_entry_spacing(body):
+    """Ensure exactly 2 blank paragraphs before every section title (except the first).
+
+    Runs repeatedly until no more adjustments are needed, so any number of
+    existing blank lines (1, 3, 4, ...) will be normalized to exactly 2.
+    """
+    section_re = re.compile(r"^\d+\.\s+\S")      # "1. Something"
+    date_skip_re = re.compile(
+        r"^\d+\.\s*(?:Januar|Februar|März|April|Mai|Juni|Juli|August|"
+        r"September|Oktober|November|Dezember)\s+\d{4}", re.IGNORECASE
+    )
+
+    while True:
+        all_paras = list(body.findall(f"{{{W}}}p"))
+        adjusted = False
+
+        for i, p in enumerate(all_paras):
+            text = "".join(t.text or "" for t in p.findall(f".//{{{W}}}t")).strip()
+
+            # Only care about section titles that have something before them
+            if not (section_re.match(text) and not date_skip_re.match(text) and i > 0):
+                continue
+
+            # Walk backwards to find last non-blank paragraph
+            j = i - 1
+            while j >= 0:
+                t2 = "".join(tt.text or "" for tt in all_paras[j].findall(f".//{{{W}}}t")).strip()
+                if t2:
+                    break
+                j -= 1
+
+            num_blanks = (i - 1) - j   # blank paragraphs between content and this title
+
+            # Skip if already correct, or if title is at the very top (j < 0)
+            if j < 0 or num_blanks == 2:
+                continue
+
+            # Remove all existing blank paragraphs before this title
+            for k in range(j + 1, i):
+                bp = all_paras[k]
+                parent = bp.getparent()
+                if parent is not None:
+                    parent.remove(bp)
+
+            # Insert exactly 2 blank paragraphs after the last content para
+            ref_p = all_paras[j]
+            ref_ppr = ref_p.find(f"{{{W}}}pPr")
+            insert_after = ref_p
+            for _ in range(2):
+                spacer = make_paragraph(ref_ppr)
+                sp_ppr = spacer.find(f"{{{W}}}pPr")
+                if sp_ppr is not None:
+                    kn = sp_ppr.find(f"{{{W}}}keepNext")
+                    if kn is not None:
+                        sp_ppr.remove(kn)
+                insert_after.addnext(spacer)
+                insert_after = spacer
+
+            adjusted = True
+            break   # Restart scan — indices changed
+
+        if not adjusted:
+            break
+
+
+# ============================================================
 # HEADER REPLACEMENTS (gewerk, region, date)
 # ============================================================
 
@@ -614,7 +683,10 @@ def main():
             print(f"Extended with {num_entries - num_sections} extra sections",
                   file=sys.stderr)
 
-        # 6. Save output
+        # 6. Normalize spacing: exactly 2 blank lines between every entry
+        normalize_entry_spacing(body)
+
+        # 7. Save output
         doc.save(output_path)
         print(json.dumps({"ok": True, "output": output_path, "sections_filled": num_entries}))
 

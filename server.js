@@ -315,7 +315,9 @@ Gib NUR ein valides JSON-Objekt zurück mit diesen Feldern:
 - ausfuehrungsort: Ort der Leistung (Stadt, PLZ oder Region)
 - beginn: Startdatum der Ausführung (Format: TT.MM.JJJJ)
 - ende: Enddatum der Ausführung (Format: TT.MM.JJJJ)
-- leistung: Kurze Beschreibung der Leistung (max 500 Zeichen)`;
+- leistung: Nur die konkreten Bauleistungen/Arbeiten als Stichpunkte (max 500 Zeichen).
+  NUR aufnehmen: Was wird gebaut/geliefert/ausgeführt? (z.B. "Dachabdichtungsarbeiten", "Los 1: Erdarbeiten")
+  NICHT aufnehmen: Erfüllungsort, Straßenadressen (z.B. "Böblinger Straße 36-38"), Frist Angebotsabgabe/Abgabefrist, Vergabeplattform-Info, elektronische Vergabe, Bieterfragen, Download-Anweisungen, Registrierung, Support-Telefon, Kostenhinweise, Verfahrensart, Dokumententyp, Datumsangaben, URLs, E-Mail-Adressen, Auftraggeber, Eignungskriterien, Zuschlagskriterien, Vertragsbedingungen`;
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -557,10 +559,10 @@ app.post('/api/vorlage', upload.single('vorlage'), (req, res) => {
 });
 
 // --- Pipeline Step 1 (NEW): Generate DOCX from pre-extracted entries ---
-app.post('/api/pipeline/generate-docx', express.json({ limit: '50mb' }), async (req, res) => {
+app.post('/api/pipeline/generate-docx', express.json({ limit: '500mb' }), async (req, res) => {
   console.log('📥 Pipeline generate-docx - received pre-extracted entries');
   try {
-    const { kundeName, gewerk, region, entries } = req.body;
+    const { kundeName, kundeId, gewerk, region, entries, sourcePdfs } = req.body;
     if (!entries?.length) return res.status(400).json({ error: 'No entries provided' });
     if (!fs.existsSync(VORLAGE_FILE)) return res.status(400).json({ error: 'Keine Vorlage hochgeladen.' });
 
@@ -569,7 +571,10 @@ app.post('/api/pipeline/generate-docx', express.json({ limit: '50mb' }), async (
 
     // 1. Generate DOCX
     console.log('  📝 Generating DOCX...');
-    const baseName = `Recherche_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
+    const _now = new Date();
+    const _dateStr = `${String(_now.getDate()).padStart(2,'0')}${String(_now.getMonth()+1).padStart(2,'0')}${String(_now.getFullYear()).slice(2)}`;
+    const _idPart = kundeId ? `${kundeId}_` : '';
+    const baseName = `Recherche_${_idPart}${_dateStr}_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
     const docxFilename = `${baseName}.docx`;
     const pdfFilename = `${baseName}.pdf`;
     const docxBuffer = await generateDocxBuffer(VORLAGE_FILE, entries, gewerk, region);
@@ -590,8 +595,24 @@ app.post('/api/pipeline/generate-docx', express.json({ limit: '50mb' }), async (
     fs.writeFileSync(path.join(previewDir, attachmentName), attachmentBuffer);
     fs.writeFileSync(path.join(previewDir, docxFilename), docxBuffer);
 
+    // Save source PDFs temporarily for SharePoint upload
+    const savedSourcePdfs = [];
+    if (sourcePdfs && Array.isArray(sourcePdfs)) {
+      const srcDir = path.join(previewDir, '_source_pdfs');
+      fs.mkdirSync(srcDir, { recursive: true });
+      for (const sp of sourcePdfs) {
+        if (sp.name && sp.data) {
+          let b64 = sp.data;
+          if (b64.includes(',')) b64 = b64.split(',')[1];
+          fs.writeFileSync(path.join(srcDir, sp.name), Buffer.from(b64, 'base64'));
+          savedSourcePdfs.push(sp.name);
+        }
+      }
+      console.log(`  📎 Saved ${savedSourcePdfs.length} source PDFs for SharePoint upload`);
+    }
+
     // Save entries as metadata for the send step
-    fs.writeFileSync(path.join(previewDir, '_meta.json'), JSON.stringify({ entries, pdfNames, docxFilename, pdfFilename, attachmentName }));
+    fs.writeFileSync(path.join(previewDir, '_meta.json'), JSON.stringify({ entries, pdfNames, docxFilename, pdfFilename, attachmentName, savedSourcePdfs }));
 
     console.log(`  ✅ Preview ready: ${previewId}/${attachmentName}`);
     res.json({ ok: true, previewId, attachmentName, entries, pdfNames });
@@ -605,7 +626,7 @@ app.post('/api/pipeline/generate-docx', express.json({ limit: '50mb' }), async (
 app.post('/api/pipeline/generate', upload.array('pdfs', 50), async (req, res) => {
   console.log('📥 Pipeline generate - received multipart request');
   try {
-    const { kundeName, gewerk, region } = req.body;
+    const { kundeName, kundeId, gewerk, region } = req.body;
     if (!req.files?.length) return res.status(400).json({ error: 'No PDFs provided' });
     if (!fs.existsSync(VORLAGE_FILE)) return res.status(400).json({ error: 'Keine Vorlage hochgeladen.' });
 
@@ -629,7 +650,9 @@ app.post('/api/pipeline/generate', upload.array('pdfs', 50), async (req, res) =>
 
     // 2. Generate DOCX
     console.log('  📝 Generating DOCX...');
-    const baseName = `Recherche_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
+    const _now2 = new Date();
+    const _dateStr2 = `${String(_now2.getDate()).padStart(2,'0')}${String(_now2.getMonth()+1).padStart(2,'0')}${String(_now2.getFullYear()).slice(2)}`;
+    const baseName = `Recherche_${kundeId || ''}_${_dateStr2}_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
     const docxFilename = `${baseName}.docx`;
     const pdfFilename = `${baseName}.pdf`;
     const docxBuffer = await generateDocxBuffer(VORLAGE_FILE, entries, gewerk, region);
@@ -776,6 +799,7 @@ app.post('/api/pipeline/send', express.json(), async (req, res) => {
 
     if (process.env.DRY_RUN === 'true') {
       console.log(`  🔸 DRY RUN — Would upload to SharePoint: ${spPath}/`);
+      if (meta.savedSourcePdfs?.length) console.log(`  🔸 DRY RUN — Would upload ${meta.savedSourcePdfs.length} source PDFs to ${spPath}/PDFs/`);
       job.sharePointPath = spPath;
     } else {
       try {
@@ -785,6 +809,19 @@ app.post('/api/pipeline/send', express.json(), async (req, res) => {
         if (meta.attachmentName.endsWith('.pdf')) {
           await uploadToSharePoint(spPath, meta.attachmentName, attachmentBuffer);
           console.log(`    ✅ ${meta.attachmentName}`);
+        }
+        // Upload source PDFs to PDFs/ subfolder
+        if (meta.savedSourcePdfs?.length) {
+          const srcDir = path.join(previewDir, '_source_pdfs');
+          const spPdfsPath = `${spPath}/PDFs`;
+          console.log(`  📎 Uploading ${meta.savedSourcePdfs.length} source PDFs to ${spPdfsPath}/`);
+          for (const srcName of meta.savedSourcePdfs) {
+            const srcFile = path.join(srcDir, srcName);
+            if (fs.existsSync(srcFile)) {
+              await uploadToSharePoint(spPdfsPath, srcName, fs.readFileSync(srcFile));
+              console.log(`    ✅ PDFs/${srcName}`);
+            }
+          }
         }
         job.sharePointPath = spPath;
       } catch (err) {

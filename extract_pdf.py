@@ -34,36 +34,68 @@ def extract_text_from_pdf(pdf_bytes):
 # ========================
 # DATE NORMALIZATION
 # ========================
+_DE_MONTHS = {
+    'januar': '01', 'februar': '02', 'märz': '03', 'marz': '03', 'maerz': '03',
+    'april': '04', 'mai': '05', 'juni': '06', 'juli': '07',
+    'august': '08', 'september': '09', 'oktober': '10',
+    'november': '11', 'dezember': '12'
+}
+# Regex fragment matching any German written month name
+_DE_MONTH_RE = r'(?:Januar|Februar|M[äa]rz|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember)'
+
+
 def normalize_date(date_str):
     """Normalize date to DD.MM.YYYY format"""
     if not date_str or date_str == "—":
         return "—"
-    
+
     date_str = date_str.strip()
-    
+
     # Already in DD.MM.YYYY format
     if re.match(r'^\d{2}\.\d{2}\.\d{4}$', date_str):
         return date_str
-    
-    # Try various date formats
-    formats = [
-        '%d.%m.%Y', '%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y',
-        '%d. %B %Y', '%d %B %Y', '%B %d, %Y'
-    ]
-    
-    for fmt in formats:
+
+    # KW (Kalenderwoche): "KW 15/2026", "KW 15 2026", "15. KW 2026" → Monday of that week
+    kw_match = re.search(
+        r'(?:KW\s*(\d{1,2})[/\s]+(\d{4})|(\d{1,2})\.\s*KW\s+(\d{4}))',
+        date_str, re.IGNORECASE
+    )
+    if kw_match:
+        if kw_match.group(1):
+            week, year = int(kw_match.group(1)), int(kw_match.group(2))
+        else:
+            week, year = int(kw_match.group(3)), int(kw_match.group(4))
         try:
-            dt = datetime.strptime(date_str, fmt)
-            return dt.strftime('%d.%m.%Y')
-        except ValueError:
-            continue
-    
-    # Extract date pattern from string
+            monday = datetime.fromisocalendar(year, week, 1)
+            return monday.strftime('%d.%m.%Y')
+        except (ValueError, AttributeError):
+            pass
+
+    # German written month name: "27. April 2026" or "1. März 2026"
+    de_match = re.search(
+        r'(\d{1,2})\.?\s*(' + _DE_MONTH_RE + r')\s+(\d{4})',
+        date_str, re.IGNORECASE
+    )
+    if de_match:
+        d = int(de_match.group(1))
+        month_raw = de_match.group(2).lower()
+        month_key = month_raw.replace('ä', 'a').replace('ae', 'a')
+        month_num = _DE_MONTHS.get(month_key) or _DE_MONTHS.get(month_raw)
+        if month_num:
+            return f"{d:02d}.{month_num}.{de_match.group(3)}"
+
+    # ISO format: 2026-04-27
+    iso_match = re.match(r'^(\d{4})-(\d{2})-(\d{2})$', date_str)
+    if iso_match:
+        y, m, d = iso_match.groups()
+        return f"{int(d):02d}.{int(m):02d}.{y}"
+
+    # Numeric with separator: 27.4.2026 / 27/4/2026
     match = re.search(r'(\d{1,2})[./\-](\d{1,2})[./\-](\d{4})', date_str)
     if match:
         d, m, y = match.groups()
         return f"{int(d):02d}.{int(m):02d}.{y}"
-    
+
     return date_str
 
 # ========================
@@ -121,14 +153,18 @@ def extract_fields_from_text(text):
                 break
     
     # --- ABGABETERMIN ---
+    _dp = r'\d{1,2}[./]\d{1,2}[./]\d{2,4}'                        # numeric: 01.09.2026
+    _dt = r'\d{1,2}\.?\s*' + _DE_MONTH_RE + r'\s+\d{4}'           # text: 27. April 2026
+    _dkw = r'(?:KW\s*\d{1,2}[/\s]+\d{4}|\d{1,2}\.\s*KW\s+\d{4})' # KW: KW 15/2026
+    _dany = r'(?:' + _dp + r'|' + _dt + r'|' + _dkw + r')'
     abgabe_patterns = [
-        r'Abgabetermin[::\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})',  # Primary
-        r'Schlusstermin[::\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})',
-        r'Angebotsfrist[::\s]*(\d{1,2}[./]\d{1,2}[./]\d{2,4})',
-        r'Frist\s+(?:zur\s+)?Angebotsabgabe[::\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})',
-        r'Abgabefrist[::\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})',
-        r'Einreichungsfrist[::\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})',
-        r'Ablauf\s+der\s+Frist[::\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})',
+        r'Abgabetermin[::\s]*(' + _dany + r')',
+        r'Schlusstermin[::\s]*(' + _dany + r')',
+        r'Angebotsfrist[::\s]*(' + _dany + r')',
+        r'Frist\s+(?:zur\s+)?Angebotsabgabe[::\s]*(' + _dany + r')',
+        r'Abgabefrist[::\s]*(' + _dany + r')',
+        r'Einreichungsfrist[::\s]*(' + _dany + r')',
+        r'Ablauf\s+der\s+Frist[::\s]*(' + _dany + r')',
     ]
     for pattern in abgabe_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -203,35 +239,41 @@ def extract_fields_from_text(text):
     # --- BEGINN / ENDE ---
     # FIRST: Try date range pattern (most reliable for paired dates)
     range_patterns = [
-        r'Beginn[:\s]*([\d./]+)[\s]*[-–]+[\s]*Ende[:\s]*([\d./]+)',  # Beginn: X - Ende: Y
-        r'Ausführungsfrist[^\n]*Beginn[:\s]*([\d./]+)[\s]*[-–]+[\s]*Ende[:\s]*([\d./]+)',  # In context
-        r'vom[:\s]*([\d./]+)[\s]*[-–bis]+[\s]*([\d./]+)',  # vom X bis Y
-        r'(\d{1,2}[./]\d{1,2}[./]\d{4})[\s]*[-–bis]+[\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})',  # X - Y
+        r'Beginn[:\s]*(' + _dany + r')[\s]*[-–]+[\s]*Ende[:\s]*(' + _dany + r')',
+        r'Ausführungsfrist[^\n]*Beginn[:\s]*(' + _dany + r')[\s]*[-–]+[\s]*Ende[:\s]*(' + _dany + r')',
+        r'vom[:\s]*(' + _dany + r')[\s]*[-–bis]+[\s]*(' + _dany + r')',
+        r'(' + _dp + r')[\s]*[-–bis]+[\s]*(' + _dp + r')',  # bare numeric pair
     ]
     for pattern in range_patterns:
         range_match = re.search(pattern, text, re.IGNORECASE)
         if range_match:
             beginn_val = range_match.group(1).strip()
             ende_val = range_match.group(2).strip()
-            if re.match(r'\d{1,2}[./]\d{1,2}[./]\d{4}', beginn_val):
-                fields['beginn'] = normalize_date(beginn_val)
-            if re.match(r'\d{1,2}[./]\d{1,2}[./]\d{4}', ende_val):
-                fields['ende'] = normalize_date(ende_val)
+            b_norm = normalize_date(beginn_val)
+            e_norm = normalize_date(ende_val)
+            # Only accept if successfully converted to DD.MM.YYYY
+            if re.match(r'^\d{2}\.\d{2}\.\d{4}$', b_norm):
+                fields['beginn'] = b_norm
+            if re.match(r'^\d{2}\.\d{2}\.\d{4}$', e_norm):
+                fields['ende'] = e_norm
             if fields['beginn'] != '—' and fields['ende'] != '—':
                 break
     
     # SECOND: Try individual patterns if still missing
     if fields['beginn'] == '—' or fields['ende'] == '—':
         date_pattern_pairs = [
-            # Standard patterns with . or / separator
-            (r'Datum\s+des\s+Beginns[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})', 
-             r'(?:Enddatum\s+der\s+Laufzeit|Datum\s+des\s+Endes)[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})'),
-            (r'Beginn[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})',
-             r'Ende[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})'),
-            (r'Leistungsbeginn[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})',
-             r'Leistungsende[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})'),
-            (r'ab[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})',
-             r'bis[:\s]*(\d{1,2}[./]\d{1,2}[./]\d{4})'),
+            (r'Datum\s+des\s+Beginns[:\s]*(' + _dany + r')',
+             r'(?:Enddatum\s+der\s+Laufzeit|Datum\s+des\s+Endes)[:\s]*(' + _dany + r')'),
+            (r'Beginn\s+der\s+Ausf[üu]hrung[:\s]*(' + _dany + r')',
+             r'(?:Fertigstellung|Ende\s+der\s+Ausf[üu]hrung)[^\n]*\n?\s*(' + _dany + r')'),
+            (r'Beginn[:\s]*(' + _dany + r')',
+             r'Ende[:\s]*(' + _dany + r')'),
+            (r'Leistungsbeginn[:\s]*(' + _dany + r')',
+             r'Leistungsende[:\s]*(' + _dany + r')'),
+            (r'Ausf[üu]hrungsbeginn[:\s]*(' + _dany + r')',
+             r'Ausf[üu]hrungsende[:\s]*(' + _dany + r')'),
+            (r'ab[:\s]*(' + _dany + r')',
+             r'bis[:\s]*(' + _dany + r')'),
         ]
         
         for beginn_pattern, ende_pattern in date_pattern_pairs:
@@ -302,22 +344,15 @@ def extract_fields_from_text(text):
     
     # ========== PRIORITY 1: "Art und Umfang der Leistung" ==========
     # Min: 10 chars | Always tried first
-    art_umfang_patterns = [
-        r'Art\s+und\s+Umfang\s+der\s+Leistung[::\s]*([\s\S]{10,5000}?)(?=\n\s*(?:Ausführungsort|Ausführungsfrist|Abgabetermin|ID:|DTAD|Vergabestelle)|\n\n\n)',
-        r'Art\s+und\s+Umfang\s+der\s+Leistung[::\s]*([\s\S]{10,5000}?)(?=\n\d+\.\s)',
-        r'Art\s+und\s+Umfang\s+der\s+Leistung[::\s]*([\s\S]{10,5000}?)(?=\n\s*Art\s+und\s+Umfang)',
-        r'Art\s+und\s+Umfang\s+der\s+Leistung[::\s]*([\s\S]{10,5000}?)(?=\n\n[A-ZÄÖÜ])',
-    ]
-    
-    for i, pattern in enumerate(art_umfang_patterns):
-        art_umfang_match = re.search(pattern, text, re.IGNORECASE)
-        if art_umfang_match:
-            art_umfang_section = art_umfang_match.group(1).strip()
-            if len(art_umfang_section) >= 10:
-                leistung_val = art_umfang_section
-                leistung_source = 'art_und_umfang'
-                print(f"PRIORITY 1 (pattern {i+1}): Art und Umfang: {len(art_umfang_section)} chars", file=sys.stderr)
-                break
+    # Stop ONLY at known metadata keywords (NOT at blank lines — content may have internal blank lines)
+    _stop = r'(?=\n\s*(?:Kennung\s+des\s+Verfahrens|Interne\s+Kennung|Haupteinstufung|Hauptklassifizierung|CPV|Land\s*:|Gesch[äa]tzter\s+Wert|Rechtsgrundlage|Datum\s+des\s+Beginns|Enddatum|Ausf[üu]hrungsort|Erf[üu]llungsort|Abgabetermin|Region\s*:|Vergabestelle|Auftraggeber|Offizielle\s+Bezeichnung|Los\s+\d+\s*:|Zuschlags|Eignungs|Nebenangebote|Geforderte\s+Sicherheiten|Bietergemeinschaften|Mehrere\s+Hauptangebote|Beginn\s+der\s+Ausf[üu]hrung|Fertigstellung\s+oder\s+Dauer|Vergabeordnung|Zahlungsbedingungen|Finanzierungs|Sonstiger\s+Hinweis))'
+    art_umfang_match = re.search(r'Art\s+und\s+Umfang\s+der\s+Leistung[:\s]*([\s\S]{10,3000}?)' + _stop, text, re.IGNORECASE)
+    if art_umfang_match:
+        art_umfang_section = art_umfang_match.group(1).strip()
+        if len(art_umfang_section) >= 10:
+            leistung_val = art_umfang_section
+            leistung_source = 'art_und_umfang'
+            print(f"PRIORITY 1: Art und Umfang: {len(art_umfang_section)} chars", file=sys.stderr)
     
     # ========== PRIORITY 1.5: Only if Kurzbeschreibung < 100 chars ==========
     if leistung_source == 'none':
@@ -451,78 +486,119 @@ Quelle: {leistung_source}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+AUFGABE: Formatiere den Leistungstext als klare Stichpunkte für eine Ausschreibungsübersicht.
+
+INHALTSREGEL — WAS BEHALTEN:
+Behalte ALLE Zeilen, die das Bauvorhaben, die Bauarbeiten oder die zu erbringenden Leistungen beschreiben.
+Das umfasst:
+- Direkte Leistungsbeschreibungen (z.B. "Trockenbauarbeiten", "Einbau von Fenstern")
+- Beschreibungen des Ist-Zustands oder Bedarfs (z.B. "Das Brückenbauwerk muss erneuert werden")
+- Technische Details und Rahmenbedingungen der Bauausführung
+- Mengen- und Maßangaben (z.B. "ca. 2.500 m²")
+- Los-Bezeichnungen mit Beschreibung (z.B. "Los 1: Erdarbeiten")
+
+ENTFERNEN — alle folgenden Kategorien und alle sinnverwandten Formulierungen:
+
+1. ORTSANGABEN (und alle Synonyme/Varianten):
+   Erfüllungsort, Ausführungsort, Leistungsort, Einsatzort, Ort der Leistung,
+   Ort der Ausführung, Ort der Leistungserbringung, Hauptort, Lieferort,
+   Straße, Straßenname, Hausnummer, PLZ, Postleitzahl, Stadtgebiet, Gemeinde,
+   Landkreis, Kreis, Bundesland, Region, NUTS, Hauptort der Ausführung
+
+2. DATUMS- UND ZEITANGABEN (und alle Synonyme/Varianten):
+   Abgabetermin, Einreichungsfrist, Angebotsfrist, Schlusstermin, Abgabefrist,
+   Beginn, Startdatum, Datum des Beginns, Leistungsbeginn, Ausführungsbeginn,
+   Ende, Enddatum, Fertigstellung, Leistungsende, Ausführungsende,
+   Laufzeit, Vertragslaufzeit, Auftragslaufzeit, Vertragsdauer, Auftragsdauer,
+   Verlängerungsoption, Verlängerung, verlängert sich, Optionsjahr,
+   KW, Kalenderwoche, "vom ... bis", "ab ... bis"
+
+3. IDS, CODES UND KENNUNGEN (und alle Synonyme/Varianten):
+   Kennung, Interne Kennung, UUID, CPV, CPV-Code, Hauptklassifizierung,
+   Aktenzeichen, Vergabenummer, Referenznummer, Auftragsnummer, ID
+
+4. VERGABE- UND PLATTFORMINFOS (und alle Synonyme/Varianten):
+   Vergabeplattform, Bieterportal, Ausschreibungsportal, URL, Link, Website,
+   E-Mail, elektronische Vergabe, Bieterfragen, Download, Registrierung,
+   Vergabestelle, Auftraggeber, Auftragnehmer, Behörde, Amt
+
+5. RECHTSFORM UND VERWALTUNG:
+   Verfahrensart, Offenes Verfahren, Beschleunigtes Verfahren, Rechtsgrundlage,
+   Rechtsform, GmbH, AG, Land, Deutschland, Bundesrepublik
+
+6. PREISE UND KOSTEN:
+   Geschätzter Wert, Kostenschätzung, EUR, Euro, Preis, Budget
+
+7. ALLGEMEINE HINWEISE ZUR LOSVERGABE (prozessual, kein Inhalt):
+   "Aufteilung in Lose: ja/nein", "Angebote sind möglich für",
+   "Angebote können eingereicht werden für", "Die Leistung wird in Losen ausgeschrieben",
+   "Losweise Vergabe", "Bieter können Angebote für"
+
+8. KATEGORIEN / KLASSIFIZIERUNGEN (und alle Synonyme/Varianten):
+   Kategorien, Kategorie, Klassifizierung, Hauptklassifizierung, Nebenklassifizierung,
+   Einstufung, Haupteinstufung, Abbruch- und Sprengarbeiten (als Kategoriename),
+   jede Zeile die mit "Kategorien:" oder "Kategorie:" beginnt
+
+9. VERGABE- UND VERFAHRENSREGELN (und alle Synonyme/Varianten):
+   Vergabeordnung, VOB, VOB/A, VOB/B, UVgO, VgV,
+   "Öffentliche Ausschreibung nach", "Beschränkte Ausschreibung nach",
+   "Bauauftrag (VOB)", "Dienstleistungsauftrag", "Lieferauftrag",
+   Angebotsabgabe, "Zugelassene Angebotsabgabe", "Angebote einreichen",
+   "elektronisch", "in Textform", "fortgeschrittene Signatur", "qualifizierte Signatur",
+   "mit Siegel", "schriftlich" (als Einreichungsform),
+   Verschlüsselung, TLS, eVergabe, "Deutsche eVergabe", Vergabesystem,
+   "Ausführung von Bauleistungen" (als allgemeiner Oberbegriff ohne konkrete Angaben)
+
+10. BIETER- UND VERTRAGSREGELN (und alle Synonyme/Varianten):
+    Nebenangebote, "Nebenangebote zugelassen", "Nebenangebote nur in Verbindung",
+    "Mehrere Hauptangebote", "Hauptangebote zugelassen",
+    Zuschlagskriterien, "Niedrigster Preis", Zuschlag,
+    "Geforderte Sicherheiten", Vertragserfüllung, Auftragssumme, Umsatzsteuer,
+    "Sicherheit für Mängelansprüche", Abschlagszahlungen, Abrechnungssumme,
+    Bietergemeinschaften, "Gesamtschuldnerisch haftend", "bevollmächtigter Vertreter",
+    Zahlungsbedingungen, Finanzierungsbedingungen, Sicherheitsleistung,
+    "Beginn der Ausführung: [Datum]", "Fertigstellung oder Dauer der Leistungen"
+
+11. VERHALTENSREGELN UND BETRIEBSHINWEISE (kein Leistungsinhalt):
+    "Es ist Umsicht und Rücksicht zu nehmen", "Rücksicht auf Schüler/innen",
+    "Rücksicht auf Mitarbeiter/innen", "Rücksicht auf Besucher",
+    "bleibt in Betrieb", "bleiben in Betrieb", "nicht von der Schule genutzt",
+    "über die Bauzeit nicht genutzt", "ist während der Arbeiten",
+    allgemeine Verhaltens- und Sorgfaltspflichten für Auftragnehmer
+
+12. REINE GEBÄUDEABMESSUNGEN (Länge/Breite in Metern — NICHT Fläche m² oder Volumen m³):
+    "Größte Gebäudelänge: X m", "Größte Gebäudebreite: X m",
+    "Gebäudehöhe: X m", "Traufhöhe", "Firsthöhe",
+    reine Längen- und Breitenangaben in Metern ohne Flächenbezug
+    BEHALTEN: Netto-Grundfläche (m²), Konditioniertes Volumen (m³), Baujahr
+
 FORMATIERUNGSREGELN:
 1. Jede Zeile beginnt mit "- " (Bindestrich + Leerzeichen)
-2. Trenne die Zeilen mit Zeilenumbrüchen (\n)
-3. Kein Fließtext-Block! Alles als einzelne, klare Stichpunkte
+2. Sätze dürfen für bessere Lesbarkeit leicht umformuliert werden — aber NICHT kürzen oder zusammenfassen!
+   Beispiel: "Das Brückenbauwerk aus 1913 muss erneuert werden" darf bleiben oder minimal umformuliert werden,
+   aber NICHT auf "Brückenerneuerung" kürzen!
+3. NIEMALS mehrere inhaltlich verschiedene Sätze zu einem zusammenfassen!
+4. Lange Fließtextsätze: pro Satz eine eigene Zeile
+5. Trenne die Zeilen mit Zeilenumbrüchen (\n)
 
-AUSSCHLÜSSE - ENTFERNE IMMER:
-- Zeilen mit "Kategorien:"
-- CPV-Codes, Klassifizierungen, Metadaten
-- "Dauerschuldverhältnis" → NIEMALS im Ergebnis!
-- Vertragslaufzeit (→ gehört in Ausführungsfrist)
-- Standorte/Adressen (→ gehört in Ausführungsort)
-- Datumsangaben in Klammern
-- Qualitäts-/Umweltstandards (ISO 9001, ISO 14001)
-- Vertragsbedingungen
-- E-Mail / E-Mail-Adressen (z.B. vergabestelle@...)
-- Auftraggeber (z.B. "Auftraggeber: Stadt...")
-- Rechtsform (z.B. "Rechtsform: Lokale Gebietskörperschaft")
-- Tätigkeit (z.B. "Tätigkeit: Allgemeine öffentliche Verwaltung")
-- Vergabeordnung (z.B. "Vergabeordnung: Bauauftrag (VOB)")
-- ID-Nummern (z.B. "ID: 24030532")
-- Aufteilung in Lose
-- Dauer der Leistungen
-- Vorgesehener Ausführungszeitraum / Ausführungszeitraum
-- Nebenangebote
-- Mehrere Hauptangebote
-- Vergabeunterlagen
-- Verschwiegenheitserklärung
-- Fehlende Unterlagen
-- Bindefrist
-- Zuschlagskriterien
-- Sicherheitsleistung
-- Bietergemeinschaft
-- Beginn der Ausführung (z.B. "Beginn der Ausführung: 18. KW 2026")
-- Fertigstellung (z.B. "Fertigstellung: 44. KW 2026")
-- Ablauf der Angebotsfrist (z.B. "Ablauf der Angebotsfrist am 19.03.2026")
-- KW-Angaben für Zeiträume
-- Sprache, in der die Angebote abgefasst sein müssen
-- Eröffnungstermin
-- Adresse für elektronische Angebote
-- URLs/Webseiten (z.B. www.vergabe.rib.de)
-- Submissionstermin
-- Zuschlagsfrist
-- Eignungskriterien
+LOSE (ABSOLUT KRITISCH!):
+"Los X:" Labels NIEMALS entfernen, ändern oder mit dem Beschreibungstext zusammenführen!
+Die exakte Schreibweise (Los 1:, Los 2:, Los 3: usw.) muss erhalten bleiben!
 
-ZEILENUMBRUCH-REGELN (KRITISCH):
+Wenn mehrere Lose vorhanden, MUSS jedes "Los X:" als eigene Zeile erhalten bleiben:
+RICHTIG:
+- Los 1: Garten- und Landschaftsbauarbeiten
+- Los 2: Erd- und Pflasterarbeiten
 
-a) ZUSAMMENFÜHREN BEI "und/oder/sowie":
-   Wenn eine Zeile mit "und ", "oder ", "sowie " beginnt,
-   MUSS sie mit der VORHERIGEN Zeile zusammengeführt werden!
-   
+FALSCH:
+- Garten- und Landschaftsbauarbeiten  ← Los-Bezeichnung fehlt!
+- Die Leistung wird in 2 Losen ausgeschrieben  ← zusammengefasst statt einzeln!
+
+ZEILENUMBRUCH-REGELN:
+a) Wenn eine Zeile mit "und ", "oder ", "sowie " beginnt → mit vorheriger Zeile zusammenführen
    FALSCH: "- Unterhalts-\n- und Grundreinigung"
    RICHTIG: "- Unterhalts- und Grundreinigung"
-
-b) ZUSAMMENFÜHREN BEI BINDESTRICH AM ENDE:
-   Wenn eine Zeile mit Bindestrich endet (z.B. "Unterhalts-", "Glas-"),
-   gehört die nächste Zeile IMMER dazu!
-
-c) ALLE LOSE BEIBEHALTEN (KRITISCH!):
-   "Los X:" NIEMALS entfernen oder ändern!
-   
-   Wenn mehrere Lose vorhanden (Los 1, Los 2, Los 3, Los 4, etc.),
-   MUSS jedes "Los X:" als eigene Zeile erhalten bleiben!
-   
-   RICHTIG:
-   - Los 1: Garten- und Landschaftsbauarbeiten
-   - Los 2: Erd- und Pflasterarbeiten
-   
-   FALSCH:
-   - Garten- und Landschaftsbauarbeiten (Los fehlt!)
-   - "Die Leistung wird in Losen ausgeschrieben" (zusammenfassend statt einzeln)
-
-d) Mengenangaben und Details beibehalten (z.B. "ca. 2.262.700 m²/Jahr")
+b) Wenn eine Zeile mit Bindestrich endet (z.B. "Unterhalts-") → nächste Zeile direkt anhängen
 
 Antworte NUR mit dem formatierten Text (Stichpunkte). Kein JSON, keine Erklärungen."""
 

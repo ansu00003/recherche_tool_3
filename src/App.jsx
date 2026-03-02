@@ -69,7 +69,7 @@ const api = {
     const r = await fetch("/api/pipeline/generate-docx", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ kundeName: data.kundeName, gewerk: data.gewerk, region: data.region, entries })
+      body: JSON.stringify({ kundeName: data.kundeName, kundeId: data.kundeId, gewerk: data.gewerk, region: data.region, entries })
     });
     if (!r.ok) throw new Error(await r.text());
     return r.json();
@@ -85,7 +85,7 @@ const api = {
 // SIGNATURES
 // ========================
 const SIGNATUREN = {
-  "Dennis Engel": { rolle: "Rechercheteam", full: "Dennis Engel\n- Rechercheteam -\nTel.: (+49) 01579-2600775\n______________________\nKALKU - Baukalkulationen\nInh. Alaatdin Coksari\nBerliner Promenade 15\nD-66111 Saarbrücken\nTel.: (+49) 0681-41096430\nInternet: https://kalku.de\nSteuer-Nr.: 040/221/35122\nUSt-IdNr.: DE334890692\n______________________" },
+  "Dennis Engel": { rolle: "Rechercheteam", full: "Dennis Engel\n- Rechercheteam -\nTel.: (+49) 160-5025551\n______________________\nKALKU - Baukalkulationen\nInh. Alaatdin Coksari\nBerliner Promenade 15\nD-66111 Saarbrücken\nTel.: (+49) 0681-41096430\nInternet: https://kalku.de\nSteuer-Nr.: 040/221/35122\nUSt-IdNr.: DE334890692\n______________________" },
   "Julian Kallenborn": { rolle: "Kundenservice", full: "Julian Kallenborn\n- Kundenservice -\nTel.: (+49) 0157-92600772\n______________________\nKALKU - Baukalkulationen\nInh. Alaatdin Coksari\nBerliner Promenade 15\nD-66111 Saarbrücken\nTel.: (+49) 0681-41096430\nInternet: https://kalku.de\nSteuer-Nr.: 040/221/35122\nUSt-IdNr.: DE334890692\n______________________" },
   "Anna Buxbaum": { rolle: "Kundenservice", full: "Anna Buxbaum\n- Kundenservice -\nTel.: (+49) 01579-2600703\n______________________\nKALKU - Baukalkulationen\nInh. Alaatdin Coksari\nBerliner Promenade 15\nD-66111 Saarbrücken\nTel.: (+49) 0681-41096430\nInternet: https://kalku.de\nSteuer-Nr.: 040/221/35122\nUSt-IdNr.: DE334890692\n______________________" },
 };
@@ -639,8 +639,10 @@ export default function App() {
   const [emailTyp, setEmailTyp] = useState("regular");
   const [anrede, setAnrede] = useState("Herr"); const [empfaengerName, setEmpfaengerName] = useState("");
   const [kundeEmail, setKundeEmail] = useState("");
+  const [extraEmails, setExtraEmails] = useState("");
   const [signaturPerson, setSignaturPerson] = useState("Dennis Engel");
   const [isEditing, setIsEditing] = useState(false); const [emailBody, setEmailBody] = useState("");
+  const [emailSubject, setEmailSubject] = useState(""); const [isEditingSubject, setIsEditingSubject] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false); const [sending, setSending] = useState(false);
   const [previewId, setPreviewId] = useState(null); const [previewPdfUrl, setPreviewPdfUrl] = useState(null); const [previewPdfName, setPreviewPdfName] = useState(null);
   const [generating, setGenerating] = useState(false);
@@ -650,6 +652,10 @@ export default function App() {
   const [vorlage, setVorlage] = useState(null);
   const [vorlageUploading, setVorlageUploading] = useState(false);
   const [pipelineRunning, setPipelineRunning] = useState(false);
+  const [extractedEntries, setExtractedEntries] = useState(null);
+  const [showReview, setShowReview] = useState(false);
+  const [extracting, setExtracting] = useState(false);
+  const [extractProgress, setExtractProgress] = useState({ current: 0, total: 0, name: "" });
   const fileRef = useRef(null);
   const vorlageRef = useRef(null);
 
@@ -664,6 +670,15 @@ export default function App() {
   useEffect(() => { if (kunde) { setEmpfaengerName(kunde.contactName || kunde.name.split(" ").pop()); if (kunde.email) setKundeEmail(kunde.email); else setKundeEmail(""); } }, [kunde]);
 
   useEffect(() => { if (!isEditing) { setEmailBody(EMAIL_TEMPLATES[emailTyp](anrede, empfaengerName || "xxx", SIGNATUREN[signaturPerson]?.full || "")); } }, [emailTyp, anrede, empfaengerName, signaturPerson, isEditing]);
+
+  useEffect(() => {
+    if (!isEditingSubject) {
+      const now = new Date();
+      const ds = `${String(now.getDate()).padStart(2,'0')}.${String(now.getMonth()+1).padStart(2,'0')}.${now.getFullYear()}`;
+      const prefix = emailTyp === "erste" ? "Erste Recherche" : "Aktuelle Recherche";
+      setEmailSubject(`${prefix} ${kunde?.name || ""} ${ds} | KALKU`);
+    }
+  }, [emailTyp, kunde, isEditingSubject]);
 
   const showToast = (msg, sub, err) => { setToast({ msg, sub, err }); setTimeout(() => setToast(null), 4000); };
   const handleVorlageUpload = async (e) => {
@@ -731,24 +746,55 @@ export default function App() {
   const handleEmailBlur = () => { if (kunde && kundeEmail.trim()) api.saveEmail(kunde.raw, kundeEmail, empfaengerName.trim() || undefined); };
   const handleNameBlur = () => { if (kunde && empfaengerName.trim()) api.saveEmail(kunde.raw, kundeEmail.trim() || undefined, empfaengerName); };
 
-  const emailSubject = emailTyp === "erste" ? `Erste Recherche ${kunde?.name || ""} | KALKU` : `Aktuelle Recherche ${kunde?.name || ""} | KALKU`;
   const canSend = kunde && kundeEmail.trim() && empfaengerName.trim() && pdfs.length > 0 && vorlage?.exists;
 
-  // Step 1: Generate PDF and show preview in confirmation modal
-  const handleStartPipeline = async () => {
+  // Step 1: Extract all PDFs and show review panel
+  const handleExtract = async () => {
+    setExtracting(true);
+    try {
+      const entries = [];
+      for (let i = 0; i < pdfs.length; i++) {
+        const pdfObj = pdfs[i];
+        setExtractProgress({ current: i + 1, total: pdfs.length, name: pdfObj.name });
+        try {
+          const extracted = await api.extractPdf(pdfObj);
+          entries.push({ ...extracted, _filename: pdfObj.name });
+        } catch {
+          entries.push({ titel: pdfObj.name, dtad_id: "—", abgabetermin: "—", ausfuehrungsort: "—", beginn: "—", ende: "—", leistung: "—", _filename: pdfObj.name });
+        }
+      }
+      setExtractedEntries(entries);
+      setShowReview(true);
+    } catch (e) {
+      showToast("Fehler beim Extrahieren", e.message || String(e), true);
+    } finally {
+      setExtracting(false);
+    }
+  };
+
+  // Step 2: Generate PDF from (possibly edited) extracted entries
+  const handleGenerateFromReview = async () => {
     setGenerating(true);
     try {
-      const result = await api.generatePipeline({ kundeName: kunde.name, gewerk, region, pdfs });
+      const r = await fetch("/api/pipeline/generate-docx", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kundeName: kunde.name, kundeId: kunde.id, gewerk, region, entries: extractedEntries, sourcePdfs: pdfs.map(p => ({ name: p.name, data: p.data })) }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const result = await r.json();
       setPreviewId(result.previewId);
       setPreviewPdfName(result.attachmentName);
       setPreviewPdfUrl(`/api/pipeline/preview/${result.previewId}/${encodeURIComponent(result.attachmentName)}`);
+      setShowReview(false);
       setShowConfirm(true);
     } catch (e) {
-      console.error('Pipeline generation error:', e);
       showToast("Fehler beim Generieren", e.message || String(e), true);
+    } finally {
+      setGenerating(false);
     }
-    finally { setGenerating(false); }
   };
+
 
   // Step 2: Send the pre-generated email after user reviews PDF
   const handleConfirmSend = async () => {
@@ -756,14 +802,15 @@ export default function App() {
     setPipelineRunning(true);
     try {
       const kundeTyp = kunde.typ === "Interessenten" ? "Interessenten" : "Aktive_Kunden";
-      const result = await api.sendPipeline({ previewId, to: kundeEmail, subject: emailSubject, body: emailBody, kundeRaw: kunde.raw, kundeName: kunde.name, kundeId: kunde.id, kundeTyp, anrede, empfaengerName, signaturPerson, emailTyp, gewerk, region });
+      const allTo = [kundeEmail, ...extraEmails.split(",").map(e => e.trim()).filter(e => e)].join(", ");
+      const result = await api.sendPipeline({ previewId, to: allTo, subject: emailSubject, body: emailBody, kundeRaw: kunde.raw, kundeName: kunde.name, kundeId: kunde.id, kundeTyp, anrede, empfaengerName, signaturPerson, emailTyp, gewerk, region });
       setSending(false); setPipelineRunning(false); setShowConfirm(false);
       setPreviewId(null); setPreviewPdfUrl(null); setPreviewPdfName(null);
       const msg = result.dryRun ? "DRY RUN — nicht gesendet" : "Pipeline abgeschlossen!";
       const sub = `${kunde.name} · ${result.generatedFile} · SharePoint: ${result.sharePointPath}`;
       showToast(msg, sub);
       loadJobs();
-      setTimeout(() => { setPdfs([]); setSelectedKunde(null); setKundeEmail(""); setEmpfaengerName(""); setIsEditing(false); }, 1500);
+      setTimeout(() => { setPdfs([]); setSelectedKunde(null); setKundeEmail(""); setExtraEmails(""); setEmpfaengerName(""); setIsEditing(false); }, 1500);
     } catch (e) { setSending(false); setPipelineRunning(false); showToast("Fehler", e.message, true); }
   };
 
@@ -806,7 +853,7 @@ export default function App() {
       `}</style>
 
       {/* Send confirm */}
-      <ConfirmModal open={showConfirm} data={{ to: kundeEmail, subject: emailSubject, body: emailBody }} onConfirm={handleConfirmSend} onCancel={() => { setShowConfirm(false); setPreviewId(null); setPreviewPdfUrl(null); setPreviewPdfName(null); }} sending={sending} title="E-Mail senden bestätigen" pdfPreviewUrl={previewPdfUrl} pdfPreviewName={previewPdfName} />
+      <ConfirmModal open={showConfirm} data={{ to: [kundeEmail, ...extraEmails.split(",").map(e => e.trim()).filter(e => e)].join(", "), subject: emailSubject, body: emailBody }} onConfirm={handleConfirmSend} onCancel={() => { setShowConfirm(false); setPreviewId(null); setPreviewPdfUrl(null); setPreviewPdfName(null); }} sending={sending} title="E-Mail senden bestätigen" pdfPreviewUrl={previewPdfUrl} pdfPreviewName={previewPdfName} />
 
       {/* Reminder confirm */}
       <ConfirmModal open={!!reminderJob} data={{ to: reminderJob?.to, subject: `Erinnerung – KALKU | ${reminderJob?.kundeName || ""}`, body: reminderPreview }} onConfirm={handleConfirmReminder} onCancel={() => setReminderJob(null)} sending={reminderSending} title="Erinnerung senden"
@@ -850,8 +897,69 @@ export default function App() {
             </button>))}
         </div>
 
+        {/* ===== REVIEW PANEL ===== */}
+        {activeTab === "verarbeiten" && showReview && extractedEntries && (
+          <div style={{ background: "#fff", borderRadius: 16, border: "1px solid #e8edf5", boxShadow: "0 2px 12px rgba(0,0,0,.04)", overflow: "hidden", marginBottom: 16 }}>
+            <div style={{ padding: "16px 20px", background: "#f8fafc", borderBottom: "1px solid #e2e8f0", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <h2 style={{ margin: 0, fontSize: 15, fontWeight: 700, display: "flex", alignItems: "center", gap: 8 }}>
+                ✏️ Extrahierte Daten prüfen & bearbeiten
+                <span style={{ fontSize: 12, fontWeight: 500, color: "#64748b" }}>({extractedEntries.length} PDF(s))</span>
+              </h2>
+              <button onClick={() => setShowReview(false)} style={{ border: "none", background: "none", cursor: "pointer", color: "#64748b", fontSize: 13, fontWeight: 600 }}>← Zurück</button>
+            </div>
+            <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 20 }}>
+              {extractedEntries.map((entry, idx) => (
+                <div key={idx} style={{ border: "1px solid #e2e8f0", borderRadius: 12, overflow: "hidden" }}>
+                  <div style={{ padding: "10px 16px", background: "#eff6ff", borderBottom: "1px solid #dbeafe", fontSize: 13, fontWeight: 700, color: "#2563eb" }}>
+                    📄 {entry._filename}
+                  </div>
+                  <div style={{ padding: 16, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    {[
+                      { key: "titel", label: "Titel" },
+                      { key: "dtad_id", label: "DTAD-ID" },
+                      { key: "abgabetermin", label: "Abgabetermin" },
+                      { key: "ausfuehrungsort", label: "Ausführungsort" },
+                      { key: "beginn", label: "Beginn" },
+                      { key: "ende", label: "Ende" },
+                    ].map(({ key, label }) => (
+                      <div key={key}>
+                        <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#475569", marginBottom: 4 }}>{label}</label>
+                        <input
+                          value={entry[key] || ""}
+                          onChange={(e) => {
+                            const updated = extractedEntries.map((en, i) => i === idx ? { ...en, [key]: e.target.value } : en);
+                            setExtractedEntries(updated);
+                          }}
+                          style={{ width: "100%", padding: "8px 12px", border: "1.5px solid #d1d5db", borderRadius: 8, fontSize: 13, outline: "none" }}
+                        />
+                      </div>
+                    ))}
+                    <div style={{ gridColumn: "1/-1" }}>
+                      <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "#475569", marginBottom: 4 }}>Art und Umfang der Leistung</label>
+                      <textarea
+                        value={entry.leistung || ""}
+                        rows={6}
+                        onChange={(e) => {
+                          const updated = extractedEntries.map((en, i) => i === idx ? { ...en, leistung: e.target.value } : en);
+                          setExtractedEntries(updated);
+                        }}
+                        style={{ width: "100%", padding: "8px 12px", border: "1.5px solid #d1d5db", borderRadius: 8, fontSize: 13, outline: "none", resize: "vertical", fontFamily: "inherit" }}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ padding: "16px 20px", borderTop: "1px solid #e2e8f0", background: "#f8fafc" }}>
+              <button onClick={handleGenerateFromReview} disabled={generating} style={{ width: "100%", padding: "14px", borderRadius: 12, border: "none", background: generating ? "#86efac" : "linear-gradient(135deg, #16a34a, #15803d)", fontSize: 15, fontWeight: 700, color: "#fff", cursor: generating ? "wait" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+                {generating ? "⏳ PDF wird generiert..." : "✅ Daten bestätigen → PDF erstellen"}
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* ===== VERARBEITEN TAB ===== */}
-        {activeTab === "verarbeiten" && (
+        {activeTab === "verarbeiten" && !showReview && (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
             {/* LEFT */}
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -859,6 +967,7 @@ export default function App() {
                 <h2 style={{ margin: "0 0 14px", fontSize: 14, fontWeight: 700, display: "flex", alignItems: "center", gap: 8 }}><I.Users /> Kunde & Einstellungen</h2>
                 <div style={{ marginBottom: 12 }}><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Kunde (SharePoint)</label><KundenDropdown kunden={kunden} value={selectedKunde} onChange={setSelectedKunde} loading={kundenLoading} onRefresh={loadKunden} /></div>
                 <div style={{ marginBottom: 12 }}><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>E-Mail {kunde?.email && <span style={{ color: "#16a34a", fontWeight: 400 }}>(gespeichert)</span>}</label><input value={kundeEmail} onChange={(e) => setKundeEmail(e.target.value)} onBlur={handleEmailBlur} placeholder="E-Mail — wird gespeichert" style={{ width: "100%", padding: "10px 14px", border: `1.5px solid ${kundeEmail ? "#bbf7d0" : "#d1d5db"}`, borderRadius: 10, fontSize: 14, outline: "none", background: kundeEmail ? "#f0fdf4" : "#fff" }} onFocus={(e) => e.target.style.borderColor = "#2563eb"} /></div>
+                <div style={{ marginBottom: 12 }}><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Weitere Empfänger <span style={{ color: "#94a3b8", fontWeight: 400 }}>(optional, kommagetrennt)</span></label><input value={extraEmails} onChange={(e) => setExtraEmails(e.target.value)} placeholder="z.B. max@firma.de, anna@firma.de" style={{ width: "100%", padding: "10px 14px", border: `1.5px solid ${extraEmails.trim() ? "#93c5fd" : "#d1d5db"}`, borderRadius: 10, fontSize: 14, outline: "none", background: extraEmails.trim() ? "#eff6ff" : "#fff" }} onFocus={(e) => e.target.style.borderColor = "#2563eb"} /></div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                   <div><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Gewerk</label><input value={gewerk} onChange={(e) => setGewerk(e.target.value)} placeholder="z.B. Gebäudereinigung" style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #d1d5db", borderRadius: 10, fontSize: 14, outline: "none" }} /></div>
                   <div><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Region</label><input value={region} onChange={(e) => setRegion(e.target.value)} placeholder="z.B. 66111 + 50km" style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #d1d5db", borderRadius: 10, fontSize: 14, outline: "none" }} /></div>
@@ -904,20 +1013,28 @@ export default function App() {
                 <div><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Signatur</label><div style={{ display: "flex", gap: 6 }}>{Object.entries(SIGNATUREN).map(([n, d]) => (<button key={n} onClick={() => { setSignaturPerson(n); setIsEditing(false); }} style={{ flex: 1, padding: "10px 8px", borderRadius: 10, textAlign: "center", border: signaturPerson === n ? "2px solid #2563eb" : "1.5px solid #d1d5db", background: signaturPerson === n ? "#eff6ff" : "#fff", cursor: "pointer" }}><div style={{ fontSize: 13, fontWeight: signaturPerson === n ? 700 : 500, color: signaturPerson === n ? "#2563eb" : "#1e293b" }}>{n}</div><div style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>{d.rolle}</div></button>))}</div></div>
               </div>
               <div style={{ background: "#fff", borderRadius: 16, border: "1px solid #e8edf5", boxShadow: "0 2px 12px rgba(0,0,0,.04)", overflow: "hidden", flex: 1 }}>
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 20px", background: "#f8fafc", borderBottom: "1px solid #e2e8f0" }}>
-                  <div style={{ fontSize: 13 }}><strong style={{ color: "#475569" }}>Betreff:</strong> {emailSubject}</div>
-                  <button onClick={() => setIsEditing(!isEditing)} style={{ border: "none", background: "none", cursor: "pointer", color: "#2563eb", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>{isEditing ? <><I.Eye /> Vorschau</> : <><I.Edit /> Bearbeiten</>}</button>
+                <div style={{ padding: "12px 20px", background: "#f8fafc", borderBottom: "1px solid #e2e8f0" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
+                      <strong style={{ color: "#475569", fontSize: 13, flexShrink: 0 }}>Betreff:</strong>
+                      {isEditingSubject ? <input value={emailSubject} onChange={(e) => setEmailSubject(e.target.value)} onBlur={() => setIsEditingSubject(false)} autoFocus style={{ flex: 1, padding: "5px 10px", border: "1.5px solid #2563eb", borderRadius: 8, fontSize: 13, outline: "none", background: "#fffef5" }} />
+                        : <span onClick={() => setIsEditingSubject(true)} style={{ fontSize: 13, cursor: "pointer", padding: "5px 10px", borderRadius: 8, border: "1.5px solid transparent", flex: 1 }} title="Klicken zum Bearbeiten">{emailSubject}</span>}
+                      {isEditingSubject ? <button onClick={() => { setIsEditingSubject(false); }} style={{ border: "none", background: "none", cursor: "pointer", color: "#16a34a", fontSize: 11, fontWeight: 600 }}>OK</button>
+                        : <button onClick={() => setIsEditingSubject(true)} style={{ border: "none", background: "none", cursor: "pointer", color: "#94a3b8", fontSize: 11, fontWeight: 600 }}>Bearbeiten</button>}
+                    </div>
+                    <button onClick={() => setIsEditing(!isEditing)} style={{ border: "none", background: "none", cursor: "pointer", color: "#2563eb", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 4, flexShrink: 0, marginLeft: 12 }}>{isEditing ? <><I.Eye /> Vorschau</> : <><I.Edit /> Text bearbeiten</>}</button>
+                  </div>
                 </div>
                 {isEditing ? <textarea value={emailBody} onChange={(e) => setEmailBody(e.target.value)} style={{ width: "100%", minHeight: 260, padding: 16, border: "none", outline: "none", fontSize: 13, lineHeight: 1.6, resize: "vertical", fontFamily: "inherit", background: "#fffef5" }} />
                   : <div style={{ padding: 16, fontSize: 13, lineHeight: 1.7, whiteSpace: "pre-wrap", maxHeight: 300, overflow: "auto" }}>{emailBody}</div>}
                 <div style={{ padding: "10px 20px", borderTop: "1px solid #f1f5f9", background: "#fafbff", display: "flex", alignItems: "center", gap: 12, fontSize: 12, color: "#64748b" }}>
-                  <span>Von: <strong>kundenservice@kalku.de</strong></span><span style={{ color: "#e2e8f0" }}>|</span><span>An: <strong>{kundeEmail || "—"}</strong></span><span style={{ color: "#e2e8f0" }}>|</span><span style={{ color: "#16a34a" }}><I.Pipedrive /> BCC</span><span style={{ color: "#e2e8f0" }}>|</span><span>{pdfs.length} PDF(s)</span>
+                  <span>Von: <strong>kundenservice@kalku.de</strong></span><span style={{ color: "#e2e8f0" }}>|</span><span>An: <strong>{[kundeEmail, ...extraEmails.split(",").map(e => e.trim()).filter(e => e)].filter(Boolean).join(", ") || "—"}</strong></span><span style={{ color: "#e2e8f0" }}>|</span><span style={{ color: "#16a34a" }}><I.Pipedrive /> BCC</span><span style={{ color: "#e2e8f0" }}>|</span><span>{pdfs.length} PDF(s)</span>
                 </div>
               </div>
             </div>
             <div style={{ gridColumn: "1/-1" }}>
-              <button onClick={handleStartPipeline} disabled={!canSend || generating} style={{ width: "100%", padding: "16px", borderRadius: 14, border: "none", background: generating ? "#86efac" : canSend ? "linear-gradient(135deg, #16a34a, #15803d)" : "#d1d5db", fontSize: 16, fontWeight: 700, color: "#fff", cursor: generating ? "wait" : canSend ? "pointer" : "not-allowed", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, boxShadow: canSend && !generating ? "0 6px 20px rgba(22,163,74,.3)" : "none" }}>
-                {generating ? "⏳ PDF wird generiert..." : <><I.Send />{canSend ? `Pipeline starten — ${pdfs.length} PDF(s) → DOCX → E-Mail an ${kunde?.name}` : [!kunde && "Kunde wählen", !kundeEmail && kunde && "E-Mail eingeben", pdfs.length === 0 && "PDFs hochladen", !vorlage?.exists && "Vorlage hochladen"].filter(Boolean).join(" · ")}</>}
+              <button onClick={handleExtract} disabled={!canSend || extracting} style={{ width: "100%", padding: "16px", borderRadius: 14, border: "none", background: extracting ? "#93c5fd" : canSend ? "linear-gradient(135deg, #2563eb, #1d4ed8)" : "#d1d5db", fontSize: 16, fontWeight: 700, color: "#fff", cursor: extracting ? "wait" : canSend ? "pointer" : "not-allowed", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, boxShadow: canSend && !extracting ? "0 6px 20px rgba(37,99,235,.3)" : "none" }}>
+                {extracting ? `⏳ Extrahiere ${extractProgress.current}/${extractProgress.total}: ${extractProgress.name}` : <><I.Send />{canSend ? `1. Daten extrahieren — ${pdfs.length} PDF(s)` : [!kunde && "Kunde wählen", !kundeEmail && kunde && "E-Mail eingeben", pdfs.length === 0 && "PDFs hochladen", !vorlage?.exists && "Vorlage hochladen"].filter(Boolean).join(" · ")}</>}
               </button>
             </div>
           </div>

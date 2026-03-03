@@ -572,7 +572,7 @@ app.post('/api/pipeline/generate-docx', express.json({ limit: '500mb' }), async 
     // 1. Generate DOCX
     console.log('  📝 Generating DOCX...');
     const _now = new Date();
-    const _dateStr = `${String(_now.getDate()).padStart(2,'0')}${String(_now.getMonth()+1).padStart(2,'0')}${String(_now.getFullYear()).slice(2)}`;
+    const _dateStr = `${String(_now.getFullYear()).slice(2)}${String(_now.getMonth()+1).padStart(2,'0')}${String(_now.getDate()).padStart(2,'0')}`;
     const _idPart = kundeId ? `${kundeId}_` : '';
     const baseName = `Recherche_${_idPart}${_dateStr}_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
     const docxFilename = `${baseName}.docx`;
@@ -651,7 +651,7 @@ app.post('/api/pipeline/generate', upload.array('pdfs', 50), async (req, res) =>
     // 2. Generate DOCX
     console.log('  📝 Generating DOCX...');
     const _now2 = new Date();
-    const _dateStr2 = `${String(_now2.getDate()).padStart(2,'0')}${String(_now2.getMonth()+1).padStart(2,'0')}${String(_now2.getFullYear()).slice(2)}`;
+    const _dateStr2 = `${String(_now2.getFullYear()).slice(2)}${String(_now2.getMonth()+1).padStart(2,'0')}${String(_now2.getDate()).padStart(2,'0')}`;
     const baseName = `Recherche_${kundeId || ''}_${_dateStr2}_${(kundeName || 'Kunde').replace(/\s+/g, '_')}`;
     const docxFilename = `${baseName}.docx`;
     const pdfFilename = `${baseName}.pdf`;
@@ -970,17 +970,46 @@ app.post('/api/pipeline/run', upload.array('pdfs', 20), async (req, res) => {
 });
 
 // --- Kunden from SharePoint ---
+// SharePoint folder cache (60s TTL)
+let _kundenCache = null;
+let _kundenCacheTime = 0;
+const KUNDEN_CACHE_TTL = 60 * 1000; // 60 seconds
+
 app.get('/api/kunden', async (req, res) => {
   try {
+    const forceRefresh = req.query.refresh === 'true';
+    const now = Date.now();
+
+    // Use cache if fresh and not forced
+    if (!forceRefresh && _kundenCache && (now - _kundenCacheTime) < KUNDEN_CACHE_TTL) {
+      // Re-merge with latest email cache
+      const ec = loadJSON(EMAIL_CACHE_FILE, {});
+      const resolve = (r) => {
+        const entry = ec[r];
+        if (!entry) return { email: '', contactName: '' };
+        if (typeof entry === 'string') return { email: entry, contactName: '' };
+        return { email: entry.email || '', contactName: entry.name || '' };
+      };
+      return res.json({
+        aktive: _kundenCache.aktive.map((r) => ({ ...parseFolderName(r), typ: 'Aktive Kunden', ...resolve(r) })),
+        interessenten: _kundenCache.interessenten.map((r) => ({ ...parseFolderName(r), typ: 'Interessenten', ...resolve(r) })),
+      });
+    }
+
     const [aRaw, iRaw] = await Promise.all([
       listSharePointFolders('Aktive_Kunden').catch(() => []),
       listSharePointFolders('Interessenten').catch(() => []),
     ]);
+
+    // Update cache
+    _kundenCache = { aktive: aRaw, interessenten: iRaw };
+    _kundenCacheTime = now;
+
     const ec = loadJSON(EMAIL_CACHE_FILE, {});
     const resolve = (r) => {
       const entry = ec[r];
       if (!entry) return { email: '', contactName: '' };
-      if (typeof entry === 'string') return { email: entry, contactName: '' }; // backward compat
+      if (typeof entry === 'string') return { email: entry, contactName: '' };
       return { email: entry.email || '', contactName: entry.name || '' };
     };
     res.json({
@@ -1002,8 +1031,273 @@ app.post('/api/kunden/email', (req, res) => {
   res.json({ ok: true });
 });
 
+// --- Pipedrive Contact Lookup ---
+app.get('/api/pipedrive/lookup', async (req, res) => {
+  const { name } = req.query;
+  if (!name) return res.json({ email: '', contactName: '', source: 'none' });
+
+  const apiToken = process.env.PIPEDRIVE_API_TOKEN;
+  const domain = process.env.PIPEDRIVE_COMPANY_DOMAIN;
+  if (!apiToken || !domain) {
+    return res.json({ email: '', contactName: '', source: 'none' });
+  }
+
+  try {
+    console.log(`  🔍 Pipedrive lookup: "${name}"`);
+
+    // Search organizations by company name
+    const searchUrl = `https://${domain}.pipedrive.com/api/v1/organizations/search?term=${encodeURIComponent(name)}&limit=5&api_token=${apiToken}`;
+    const searchRes = await fetch(searchUrl);
+    if (!searchRes.ok) throw new Error(`Pipedrive search ${searchRes.status}`);
+    const searchData = await searchRes.json();
+
+    const items = searchData?.data?.items;
+    if (!items || items.length === 0) {
+      console.log(`  ℹ️ Pipedrive: no org found for "${name}"`);
+      return res.json({ email: '', contactName: '', source: 'pipedrive_no_match' });
+    }
+
+    const orgId = items[0].item.id;
+    const orgName = items[0].item.name;
+    console.log(`  ✅ Pipedrive org: "${orgName}" (ID: ${orgId})`);
+
+    // Get persons linked to this organization
+    const personsUrl = `https://${domain}.pipedrive.com/api/v1/organizations/${orgId}/persons?limit=10&api_token=${apiToken}`;
+    const personsRes = await fetch(personsUrl);
+    if (!personsRes.ok) throw new Error(`Pipedrive persons ${personsRes.status}`);
+    const personsData = await personsRes.json();
+
+    let persons = personsData?.data;
+
+    // Fallback: if no persons linked to org, search persons by org name
+    if (!persons || persons.length === 0) {
+      console.log(`  ℹ️ Pipedrive: no linked persons, searching by org name...`);
+      const psUrl = `https://${domain}.pipedrive.com/api/v1/persons/search?term=${encodeURIComponent(orgName)}&limit=5&api_token=${apiToken}`;
+      const psRes = await fetch(psUrl);
+      if (psRes.ok) {
+        const psData = await psRes.json();
+        const psItems = psData?.data?.items;
+        if (psItems?.length) {
+          persons = [];
+          for (const item of psItems) {
+            const pRes = await fetch(`https://${domain}.pipedrive.com/api/v1/persons/${item.item.id}?api_token=${apiToken}`);
+            if (pRes.ok) { const pd = await pRes.json(); if (pd.data) persons.push(pd.data); }
+          }
+          console.log(`  ✅ Pipedrive: found ${persons.length} person(s) via search`);
+        }
+      }
+    }
+
+    if (!persons || persons.length === 0) {
+      console.log(`  ℹ️ Pipedrive: no persons found for "${orgName}"`);
+      return res.json({ email: '', extraEmails: '', contactName: '', source: 'pipedrive_no_persons' });
+    }
+
+    // Collect all emails from all persons, use first person's last name
+    const allEmails = [];
+    let contactLastName = '';
+    for (const person of persons) {
+      if (!contactLastName) contactLastName = person.last_name || person.name?.split(' ').pop() || '';
+      const emails = person.email || [];
+      // Primary email first
+      const primary = emails.find(e => e.primary);
+      if (primary?.value && !allEmails.includes(primary.value)) allEmails.push(primary.value);
+      for (const em of emails) {
+        if (em.value && !allEmails.includes(em.value)) allEmails.push(em.value);
+      }
+    }
+
+    if (allEmails.length === 0) {
+      return res.json({ email: '', extraEmails: '', contactName: contactLastName, source: 'pipedrive_no_email' });
+    }
+
+    const primaryEmail = allEmails[0];
+    const extraEmails = allEmails.slice(1).join(', ');
+    console.log(`  ✅ Pipedrive contact: ${contactLastName} — ${allEmails.length} email(s): ${allEmails.join(', ')}`);
+    return res.json({ email: primaryEmail, extraEmails, contactName: contactLastName, source: 'pipedrive' });
+
+  } catch (err) {
+    console.error(`  ❌ Pipedrive lookup failed:`, err.message);
+    return res.json({ email: '', contactName: '', source: 'error' });
+  }
+});
+
+// ========================
+// PIPEDRIVE REPLY TRACKING
+// ========================
+async function checkPipedriveReply(job) {
+  const apiToken = process.env.PIPEDRIVE_API_TOKEN;
+  const domain = process.env.PIPEDRIVE_COMPANY_DOMAIN;
+  if (!apiToken || !domain) return { replied: false, error: 'no_config' };
+
+  try {
+    // Fast path: if we already have the thread ID, just check message_count
+    if (job.pipedriveThreadId) {
+      const threadUrl = `https://${domain}.pipedrive.com/api/v1/mailbox/mailThreads/${job.pipedriveThreadId}?api_token=${apiToken}`;
+      const res = await fetch(threadUrl);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.data && data.data.message_count > 1) {
+          return { replied: true, threadId: job.pipedriveThreadId };
+        }
+        return { replied: false, threadId: job.pipedriveThreadId };
+      }
+      // Thread ID might be stale, fall through to full lookup
+    }
+
+    // Step 1: Find person by recipient email
+    let personId = job.pipedrivePersonId || null;
+    if (!personId) {
+      const searchUrl = `https://${domain}.pipedrive.com/api/v1/persons/search?term=${encodeURIComponent(job.to)}&limit=5&api_token=${apiToken}`;
+      const searchRes = await fetch(searchUrl);
+      if (!searchRes.ok) throw new Error(`Person search failed: ${searchRes.status}`);
+      const searchData = await searchRes.json();
+      const items = searchData?.data?.items;
+      if (items?.length) {
+        personId = items[0].item.id;
+      }
+    }
+
+    if (!personId) return { replied: false, error: 'person_not_found' };
+
+    // Step 2: Get person's mail messages
+    const mailUrl = `https://${domain}.pipedrive.com/api/v1/persons/${personId}/mailMessages?limit=50&api_token=${apiToken}`;
+    const mailRes = await fetch(mailUrl);
+    if (!mailRes.ok) throw new Error(`Mail fetch failed: ${mailRes.status}`);
+    const mailData = await mailRes.json();
+
+    // Step 3: Find matching thread by subject
+    const jobSubject = (job.subject || '').toLowerCase().replace(/^(re:|aw:|fwd?:)\s*/gi, '').trim();
+    for (const item of (mailData.data || [])) {
+      const threadSubject = (item.subject || '').toLowerCase().replace(/^(re:|aw:|fwd?:)\s*/gi, '').trim();
+      if (threadSubject.includes(jobSubject) || jobSubject.includes(threadSubject)) {
+        const threadId = item.mail_thread_id || item.id;
+        if (item.message_count > 1) {
+          return { replied: true, threadId, personId };
+        }
+        return { replied: false, threadId, personId };
+      }
+    }
+
+    return { replied: false, personId };
+  } catch (err) {
+    console.error(`  ❌ Reply check failed for job ${job.id}:`, err.message);
+    return { replied: false, error: err.message };
+  }
+}
+
+// Background reply checker — runs every 10 minutes
+let replyCheckRunning = false;
+async function backgroundReplyCheck() {
+  if (replyCheckRunning) return;
+  const apiToken = process.env.PIPEDRIVE_API_TOKEN;
+  const domain = process.env.PIPEDRIVE_COMPANY_DOMAIN;
+  if (!apiToken || !domain) return;
+
+  replyCheckRunning = true;
+  try {
+    const jobs = loadJSON(JOBS_FILE, []);
+    const now = Date.now();
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    const tenMinMs = 10 * 60 * 1000;
+
+    const toCheck = jobs.filter(j =>
+      j.replyStatus !== 'replied' &&
+      !j.dryRun &&
+      j.messageId &&
+      (now - new Date(j.sentAt).getTime()) < sevenDaysMs &&
+      (!j.lastReplyCheck || (now - new Date(j.lastReplyCheck).getTime()) > tenMinMs)
+    );
+
+    if (toCheck.length === 0) { replyCheckRunning = false; return; }
+    console.log(`\n🔍 [ReplyCheck] Checking ${toCheck.length} job(s)...`);
+
+    let changed = false;
+    for (const job of toCheck) {
+      const result = await checkPipedriveReply(job);
+      job.lastReplyCheck = new Date().toISOString();
+
+      if (result.replied && job.replyStatus !== 'replied') {
+        job.replyStatus = 'replied';
+        job.replyDetectedAt = new Date().toISOString();
+        console.log(`  ✅ [ReplyCheck] Reply detected: ${job.kundeName} (${job.id})`);
+        changed = true;
+      }
+      if (result.threadId) job.pipedriveThreadId = result.threadId;
+      if (result.personId) job.pipedrivePersonId = result.personId;
+      if (result.error) job.replyCheckError = result.error;
+
+      // Throttle: 200ms between checks
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    if (changed || toCheck.length > 0) saveJSON(JOBS_FILE, jobs);
+    console.log(`  🔍 [ReplyCheck] Done. ${changed ? 'Updates saved.' : 'No new replies.'}`);
+  } catch (err) {
+    console.error('❌ [ReplyCheck] Error:', err.message);
+  } finally {
+    replyCheckRunning = false;
+  }
+}
+
+// Run every 10 minutes, first check 30s after startup
+setInterval(backgroundReplyCheck, 10 * 60 * 1000);
+setTimeout(backgroundReplyCheck, 30000);
+
 // --- Jobs ---
 app.get('/api/jobs', (req, res) => res.json(loadJSON(JOBS_FILE, [])));
+
+// --- Reply Status (lightweight read from jobs.json) ---
+app.get('/api/jobs/reply-status', (req, res) => {
+  const jobs = loadJSON(JOBS_FILE, []);
+  const statuses = jobs.map(j => ({
+    id: j.id,
+    replyStatus: j.replyStatus || 'none',
+    replyDetectedAt: j.replyDetectedAt || null,
+    lastReplyCheck: j.lastReplyCheck || null,
+  }));
+  res.json(statuses);
+});
+
+// --- Manual reply check for a single job ---
+app.post('/api/jobs/:jobId/check-reply', async (req, res) => {
+  try {
+    const jobs = loadJSON(JOBS_FILE, []);
+    const job = jobs.find(j => j.id === req.params.jobId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+
+    const result = await checkPipedriveReply(job);
+    job.lastReplyCheck = new Date().toISOString();
+
+    if (result.replied) {
+      job.replyStatus = 'replied';
+      job.replyDetectedAt = job.replyDetectedAt || new Date().toISOString();
+    } else {
+      job.replyStatus = 'none';
+    }
+    if (result.threadId) job.pipedriveThreadId = result.threadId;
+    if (result.personId) job.pipedrivePersonId = result.personId;
+    if (result.error) job.replyCheckError = result.error;
+
+    saveJSON(JOBS_FILE, jobs);
+    res.json({ replyStatus: job.replyStatus, replyDetectedAt: job.replyDetectedAt });
+  } catch (e) {
+    console.error('❌ Check reply:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// --- Manually mark a job as replied ---
+app.post('/api/jobs/:jobId/mark-replied', (req, res) => {
+  const jobs = loadJSON(JOBS_FILE, []);
+  const job = jobs.find(j => j.id === req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  job.replyStatus = 'replied';
+  job.replyDetectedAt = job.replyDetectedAt || new Date().toISOString();
+  saveJSON(JOBS_FILE, jobs);
+  res.json({ ok: true, replyStatus: 'replied' });
+});
 
 // --- Send Email (saves as job) ---
 app.post('/api/send', upload.array('pdfs', 20), async (req, res) => {

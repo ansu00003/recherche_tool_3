@@ -6,8 +6,9 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mj
 // API
 // ========================
 const api = {
-  async getKunden() { const r = await fetch("/api/kunden"); if (!r.ok) throw new Error(await r.text()); return r.json(); },
+  async getKunden(forceRefresh) { const r = await fetch(`/api/kunden${forceRefresh ? '?refresh=true' : ''}`); if (!r.ok) throw new Error(await r.text()); return r.json(); },
   async saveEmail(kundeRaw, email, name) { return (await fetch("/api/kunden/email", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kundeRaw, email, name }) })).json(); },
+  async lookupPipedrive(name) { const r = await fetch(`/api/pipedrive/lookup?name=${encodeURIComponent(name)}`); if (!r.ok) return { email: '', contactName: '' }; return r.json(); },
   async getJobs() { const r = await fetch("/api/jobs"); return r.json(); },
   async sendEmail(data) {
     const form = new FormData();
@@ -24,6 +25,9 @@ const api = {
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
+  async getReplyStatuses() { return (await fetch("/api/jobs/reply-status")).json(); },
+  async checkReply(jobId) { const r = await fetch(`/api/jobs/${jobId}/check-reply`, { method: "POST" }); if (!r.ok) throw new Error(await r.text()); return r.json(); },
+  async markReplied(jobId) { const r = await fetch(`/api/jobs/${jobId}/mark-replied`, { method: "POST" }); if (!r.ok) throw new Error(await r.text()); return r.json(); },
   async health() { return (await fetch("/api/health")).json(); },
   async getVorlage() { return (await fetch("/api/vorlage")).json(); },
   async uploadVorlage(file) {
@@ -330,8 +334,18 @@ function Toast({ show, msg, sub, err }) {
 // ========================
 // JOBS TAB
 // ========================
-function JobsTab({ jobs, onRefresh, onSendReminder }) {
+function JobsTab({ jobs, onRefresh, onSendReminder, replyStatuses, onCheckReply, onMarkReplied }) {
   const fmtDate = (iso) => { const d = new Date(iso); return d.toLocaleDateString("de-DE", { day: "2-digit", month: "2-digit", year: "numeric" }) + " " + d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" }); };
+
+  const getReplyBadge = (job) => {
+    if (job.dryRun || !job.messageId) return null;
+    const status = replyStatuses?.[job.id];
+    const replied = status?.replyStatus === 'replied';
+    const hoursAgo = (Date.now() - new Date(job.sentAt).getTime()) / (1000 * 60 * 60);
+    if (replied) return { label: "Antwort erhalten", bg: "#dcfce7", color: "#16a34a", border: "#bbf7d0", icon: <I.Check />, alert: false };
+    if (hoursAgo > 24) return { label: "Keine Antwort (24h+)", bg: "#fef2f2", color: "#ef4444", border: "#fecaca", icon: <I.Bell />, alert: true };
+    return { label: "Warte auf Antwort", bg: "#fffbeb", color: "#b45309", border: "#fde68a", icon: <I.Clock />, alert: false };
+  };
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -346,21 +360,29 @@ function JobsTab({ jobs, onRefresh, onSendReminder }) {
           <p style={{ color: "#64748b", fontSize: 14 }}>Gesendete E-Mails erscheinen hier</p>
         </div>
       )}
-      {jobs.map((job) => (
-        <div key={job.id} style={{ background: "#fff", borderRadius: 14, border: "1px solid #e8edf5", boxShadow: "0 2px 8px rgba(0,0,0,0.03)", overflow: "hidden" }}>
+      {jobs.map((job) => {
+        const badge = getReplyBadge(job);
+        return (
+        <div key={job.id} style={{ background: "#fff", borderRadius: 14, border: badge?.alert ? "1.5px solid #fecaca" : "1px solid #e8edf5", boxShadow: "0 2px 8px rgba(0,0,0,0.03)", overflow: "hidden" }}>
           {/* Header */}
           <div style={{ padding: "14px 20px", display: "flex", alignItems: "center", gap: 14 }}>
             <div style={{ width: 40, height: 40, borderRadius: 10, background: job.emailTyp === "erste" ? "#f5f3ff" : "#eff6ff", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
               <I.Mail />
             </div>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <span style={{ fontWeight: 700, fontSize: 15, color: "#0f172a" }}>{job.kundeName || job.kundeRaw}</span>
                 {job.kundeId && <span style={{ color: "#2563eb", fontSize: 12, fontWeight: 600 }}>#{job.kundeId}</span>}
                 <span style={{ background: job.emailTyp === "erste" ? "#f5f3ff" : "#eff6ff", color: job.emailTyp === "erste" ? "#7c3aed" : "#2563eb", fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 6 }}>
                   {job.emailTyp === "erste" ? "Erste" : "Regulär"}
                 </span>
                 {job.dryRun && <span style={{ background: "#fef3c7", color: "#b45309", fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4 }}>DRY</span>}
+                {/* Reply status badge */}
+                {badge && (
+                  <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: 6, background: badge.bg, color: badge.color, border: `1px solid ${badge.border}`, animation: badge.alert ? "pulse 2s infinite" : "none" }}>
+                    {badge.icon} {badge.label}
+                  </span>
+                )}
               </div>
               <div style={{ fontSize: 12, color: "#64748b", marginTop: 2, display: "flex", alignItems: "center", gap: 8 }}>
                 <span style={{ display: "flex", alignItems: "center", gap: 4 }}><I.Clock /> {fmtDate(job.sentAt)}</span>
@@ -369,17 +391,40 @@ function JobsTab({ jobs, onRefresh, onSendReminder }) {
                 <span>· von {job.signaturPerson}</span>
               </div>
             </div>
-            {/* Reminder button */}
-            <button onClick={() => onSendReminder(job)} style={{
-              padding: "8px 16px", borderRadius: 8,
-              border: "1.5px solid #f59e0b", background: "#fffbeb",
-              fontSize: 13, fontWeight: 600, color: "#b45309",
-              cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
-              transition: "all .15s",
-            }} onMouseEnter={(e) => { e.currentTarget.style.background = "#fef3c7"; }} onMouseLeave={(e) => { e.currentTarget.style.background = "#fffbeb"; }}>
-              <I.Bell /> Erinnerung
-            </button>
+            {/* Action buttons */}
+            <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+              {/* Check reply manually */}
+              {badge && !badge.alert && badge.label !== "Antwort erhalten" && (
+                <button onClick={() => onCheckReply(job.id)} title="Antwort jetzt prüfen" style={{ border: "1px solid #d1d5db", background: "#fff", borderRadius: 8, width: 34, height: 34, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "#64748b" }}>
+                  <I.Refresh />
+                </button>
+              )}
+              {/* Mark as replied manually */}
+              {badge && badge.label !== "Antwort erhalten" && (
+                <button onClick={() => onMarkReplied(job.id)} title="Als beantwortet markieren" style={{ border: "1px solid #bbf7d0", background: "#f0fdf4", borderRadius: 8, width: 34, height: 34, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", color: "#16a34a" }}>
+                  <I.Check />
+                </button>
+              )}
+              {/* Reminder button */}
+              <button onClick={() => onSendReminder(job)} style={{
+                padding: "8px 16px", borderRadius: 8,
+                border: "1.5px solid #f59e0b", background: badge?.alert ? "#fef3c7" : "#fffbeb",
+                fontSize: 13, fontWeight: 600, color: "#b45309",
+                cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
+                transition: "all .15s",
+              }} onMouseEnter={(e) => { e.currentTarget.style.background = "#fef3c7"; }} onMouseLeave={(e) => { e.currentTarget.style.background = badge?.alert ? "#fef3c7" : "#fffbeb"; }}>
+                <I.Bell /> Erinnerung
+              </button>
+            </div>
           </div>
+          {/* Reply detected info */}
+          {replyStatuses?.[job.id]?.replyStatus === 'replied' && replyStatuses[job.id].replyDetectedAt && (
+            <div style={{ padding: "0 20px 8px" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#16a34a", padding: "6px 10px", background: "#dcfce7", borderRadius: 6, fontWeight: 600 }}>
+                <I.Check /> Antwort erkannt am {fmtDate(replyStatuses[job.id].replyDetectedAt)}
+              </div>
+            </div>
+          )}
           {/* Reminders sent */}
           {job.reminders?.length > 0 && (
             <div style={{ padding: "0 20px 12px", display: "flex", flexDirection: "column", gap: 4 }}>
@@ -399,7 +444,8 @@ function JobsTab({ jobs, onRefresh, onSendReminder }) {
             </div>
           )}
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -407,7 +453,7 @@ function JobsTab({ jobs, onRefresh, onSendReminder }) {
 // ========================
 // KUNDEN TAB
 // ========================
-function KundenTab({ kunden, jobs, onSendReminder }) {
+function KundenTab({ kunden, jobs, onSendReminder, replyStatuses }) {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("alle");
   const [expandedKunde, setExpandedKunde] = useState(null);
@@ -582,6 +628,15 @@ function KundenTab({ kunden, jobs, onSendReminder }) {
                             {job.emailTyp === "erste" ? "Erste" : "Regulär"}
                           </span>
                           {job.dryRun && <span style={{ background: "#fef3c7", color: "#b45309", fontSize: 10, fontWeight: 700, padding: "1px 5px", borderRadius: 4 }}>DRY</span>}
+                          {/* Reply status in KundenTab */}
+                          {!job.dryRun && job.messageId && (() => {
+                            const rs = replyStatuses?.[job.id];
+                            const replied = rs?.replyStatus === 'replied';
+                            const hoursAgo = (Date.now() - new Date(job.sentAt).getTime()) / (1000 * 60 * 60);
+                            if (replied) return <span style={{ display: "flex", alignItems: "center", gap: 3, fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: "#dcfce7", color: "#16a34a" }}><I.Check /> Beantwortet</span>;
+                            if (hoursAgo > 24) return <span style={{ display: "flex", alignItems: "center", gap: 3, fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 4, background: "#fef2f2", color: "#ef4444", animation: "pulse 2s infinite" }}><I.Bell /> 24h+</span>;
+                            return null;
+                          })()}
                         </div>
                         <div style={{ fontSize: 11, color: "#64748b", marginTop: 2, display: "flex", alignItems: "center", gap: 6 }}>
                           <span style={{ display: "flex", alignItems: "center", gap: 3 }}><I.Clock /> {fmtDate(job.sentAt)}</span>
@@ -656,18 +711,57 @@ export default function App() {
   const [showReview, setShowReview] = useState(false);
   const [extracting, setExtracting] = useState(false);
   const [extractProgress, setExtractProgress] = useState({ current: 0, total: 0, name: "" });
+  const [pipedriveLoading, setPipedriveLoading] = useState(false);
+  const [replyStatuses, setReplyStatuses] = useState({});
   const fileRef = useRef(null);
   const vorlageRef = useRef(null);
 
   const kunde = selectedKunde ? kunden.find((k) => k.raw === selectedKunde) : null;
 
-  const loadKunden = useCallback(async () => { setKundenLoading(true); try { const d = await api.getKunden(); setKunden([...(d.aktive || []), ...(d.interessenten || [])]); } catch (e) { showToast(e.message, null, true); } finally { setKundenLoading(false); } }, []);
+  const loadKunden = useCallback(async (forceRefresh) => { setKundenLoading(true); try { const d = await api.getKunden(forceRefresh); setKunden([...(d.aktive || []), ...(d.interessenten || [])]); } catch (e) { showToast(e.message, null, true); } finally { setKundenLoading(false); } }, []);
   const loadJobs = useCallback(async () => { try { setJobs(await api.getJobs()); } catch (e) { console.error(e); } }, []);
 
   const loadVorlage = useCallback(async () => { try { setVorlage(await api.getVorlage()); } catch (e) { console.error(e); } }, []);
-  useEffect(() => { api.health().then(setServerStatus).catch(() => {}); loadKunden(); loadJobs(); loadVorlage(); }, [loadKunden, loadJobs, loadVorlage]);
+  const loadReplyStatuses = useCallback(async () => {
+    try {
+      const statuses = await api.getReplyStatuses();
+      const map = {};
+      statuses.forEach(s => { map[s.id] = s; });
+      setReplyStatuses(map);
+    } catch (e) { console.error('Reply status fetch failed:', e); }
+  }, []);
 
-  useEffect(() => { if (kunde) { setEmpfaengerName(kunde.contactName || kunde.name.split(" ").pop()); if (kunde.email) setKundeEmail(kunde.email); else setKundeEmail(""); } }, [kunde]);
+  useEffect(() => { api.health().then(setServerStatus).catch(() => {}); loadKunden(); loadJobs(); loadVorlage(); loadReplyStatuses(); }, [loadKunden, loadJobs, loadVorlage, loadReplyStatuses]);
+
+  // Auto-refresh customer list every 60s, reply statuses every 2 min
+  useEffect(() => { const iv = setInterval(() => loadKunden(true), 60000); return () => clearInterval(iv); }, [loadKunden]);
+  useEffect(() => { const iv = setInterval(loadReplyStatuses, 2 * 60 * 1000); return () => clearInterval(iv); }, [loadReplyStatuses]);
+
+  useEffect(() => {
+    if (!kunde) return;
+    let aborted = false;
+    setEmpfaengerName(kunde.contactName || kunde.name.split(" ").pop());
+    setExtraEmails("");
+    if (kunde.email) {
+      setKundeEmail(kunde.email);
+    } else {
+      setKundeEmail("");
+      setPipedriveLoading(true);
+      api.lookupPipedrive(kunde.name)
+        .then((result) => {
+          if (aborted) return;
+          if (result.email) {
+            setKundeEmail(prev => prev || result.email);
+            api.saveEmail(kunde.raw, result.email, result.contactName || undefined);
+          }
+          if (result.extraEmails) setExtraEmails(prev => prev || result.extraEmails);
+          if (result.contactName) setEmpfaengerName(result.contactName);
+        })
+        .catch(() => {})
+        .finally(() => { if (!aborted) setPipedriveLoading(false); });
+    }
+    return () => { aborted = true; };
+  }, [kunde]);
 
   useEffect(() => { if (!isEditing) { setEmailBody(EMAIL_TEMPLATES[emailTyp](anrede, empfaengerName || "xxx", SIGNATUREN[signaturPerson]?.full || "")); } }, [emailTyp, anrede, empfaengerName, signaturPerson, isEditing]);
 
@@ -833,9 +927,20 @@ export default function App() {
 
   const reminderPreview = reminderJob ? buildReminderText(reminderJob.anrede, reminderJob.empfaengerName, reminderJob.signaturPerson) : "";
 
+  const needsAttentionCount = useMemo(() => {
+    const now = Date.now();
+    const twentyFourHours = 24 * 60 * 60 * 1000;
+    return jobs.filter(j => {
+      const status = replyStatuses[j.id];
+      const noReply = !status || status.replyStatus !== 'replied';
+      const sentLongAgo = (now - new Date(j.sentAt).getTime()) > twentyFourHours;
+      return noReply && sentLongAgo && !j.dryRun && j.messageId;
+    }).length;
+  }, [jobs, replyStatuses]);
+
   const tabs = [
     { key: "verarbeiten", label: "Verarbeiten & Senden", icon: <I.Send /> },
-    { key: "jobs", label: "Jobs", icon: <I.Briefcase />, badge: jobs.length },
+    { key: "jobs", label: "Jobs", icon: <I.Briefcase />, badge: jobs.length, alertBadge: needsAttentionCount },
     { key: "kunden", label: "Kunden", icon: <I.Users />, badge: kunden.length },
     { key: "einstellungen", label: "Einstellungen", icon: <I.Settings /> },
   ];
@@ -848,6 +953,7 @@ export default function App() {
         @keyframes fadeIn{from{opacity:0}to{opacity:1}}
         @keyframes modalIn{from{opacity:0;transform:scale(.95) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}
         @keyframes slideIn{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
         input::placeholder,textarea::placeholder{color:#94a3b8}*{box-sizing:border-box}
         ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:3px}
       `}</style>
@@ -894,6 +1000,7 @@ export default function App() {
               boxShadow: activeTab === t.key ? "0 4px 12px rgba(37,99,235,.25)" : "none",
             }}>{t.icon} {t.label}
               {t.badge > 0 && <span style={{ background: activeTab === t.key ? "rgba(255,255,255,.25)" : "#e2e8f0", color: activeTab === t.key ? "#fff" : "#64748b", fontSize: 11, fontWeight: 700, padding: "1px 8px", borderRadius: 10 }}>{t.badge}</span>}
+              {t.alertBadge > 0 && <span style={{ background: "#ef4444", color: "#fff", fontSize: 10, fontWeight: 700, padding: "1px 6px", borderRadius: 10, animation: "pulse 2s infinite" }}>{t.alertBadge}</span>}
             </button>))}
         </div>
 
@@ -905,13 +1012,26 @@ export default function App() {
                 ✏️ Extrahierte Daten prüfen & bearbeiten
                 <span style={{ fontSize: 12, fontWeight: 500, color: "#64748b" }}>({extractedEntries.length} PDF(s))</span>
               </h2>
-              <button onClick={() => setShowReview(false)} style={{ border: "none", background: "none", cursor: "pointer", color: "#64748b", fontSize: 13, fontWeight: 600 }}>← Zurück</button>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <button onClick={() => {
+                  setExtractedEntries(prev => [...prev, { _filename: "Neuer Eintrag", titel: "", dtad_id: "", abgabetermin: "", ausfuehrungsort: "", beginn: "", ende: "", leistung: "" }]);
+                }} style={{ border: "1px solid #2563eb", background: "#eff6ff", color: "#2563eb", cursor: "pointer", fontSize: 12, fontWeight: 600, padding: "6px 12px", borderRadius: 8 }}>+ Eintrag</button>
+                <button onClick={() => setShowReview(false)} style={{ border: "none", background: "none", cursor: "pointer", color: "#64748b", fontSize: 13, fontWeight: 600 }}>← Zurück</button>
+              </div>
             </div>
             <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 20 }}>
               {extractedEntries.map((entry, idx) => (
                 <div key={idx} style={{ border: "1px solid #e2e8f0", borderRadius: 12, overflow: "hidden" }}>
-                  <div style={{ padding: "10px 16px", background: "#eff6ff", borderBottom: "1px solid #dbeafe", fontSize: 13, fontWeight: 700, color: "#2563eb" }}>
-                    📄 {entry._filename}
+                  <div style={{ padding: "10px 16px", background: "#eff6ff", borderBottom: "1px solid #dbeafe", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ background: "#2563eb", color: "#fff", width: 24, height: 24, borderRadius: "50%", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>{idx + 1}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: "#2563eb" }}>{entry.titel || entry._filename}</span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      <button title="Nach oben" disabled={idx === 0} onClick={() => { const arr = [...extractedEntries]; [arr[idx - 1], arr[idx]] = [arr[idx], arr[idx - 1]]; setExtractedEntries(arr); }} style={{ border: "1px solid #d1d5db", background: "#fff", borderRadius: 6, width: 28, height: 28, cursor: idx === 0 ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: idx === 0 ? "#d1d5db" : "#64748b", opacity: idx === 0 ? 0.5 : 1 }}>↑</button>
+                      <button title="Nach unten" disabled={idx === extractedEntries.length - 1} onClick={() => { const arr = [...extractedEntries]; [arr[idx], arr[idx + 1]] = [arr[idx + 1], arr[idx]]; setExtractedEntries(arr); }} style={{ border: "1px solid #d1d5db", background: "#fff", borderRadius: 6, width: 28, height: 28, cursor: idx === extractedEntries.length - 1 ? "default" : "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: idx === extractedEntries.length - 1 ? "#d1d5db" : "#64748b", opacity: idx === extractedEntries.length - 1 ? 0.5 : 1 }}>↓</button>
+                      <button title="Eintrag löschen" onClick={() => { if (extractedEntries.length === 1 || window.confirm(`„${entry.titel || entry._filename}" wirklich löschen?`)) setExtractedEntries(prev => prev.filter((_, i) => i !== idx)); }} style={{ border: "1px solid #fecaca", background: "#fef2f2", borderRadius: 6, width: 28, height: 28, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: "#ef4444" }}>×</button>
+                    </div>
                   </div>
                   <div style={{ padding: 16, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
                     {[
@@ -965,8 +1085,8 @@ export default function App() {
             <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
               <div style={{ background: "#fff", borderRadius: 16, padding: 20, border: "1px solid #e8edf5", boxShadow: "0 2px 12px rgba(0,0,0,.04)" }}>
                 <h2 style={{ margin: "0 0 14px", fontSize: 14, fontWeight: 700, display: "flex", alignItems: "center", gap: 8 }}><I.Users /> Kunde & Einstellungen</h2>
-                <div style={{ marginBottom: 12 }}><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Kunde (SharePoint)</label><KundenDropdown kunden={kunden} value={selectedKunde} onChange={setSelectedKunde} loading={kundenLoading} onRefresh={loadKunden} /></div>
-                <div style={{ marginBottom: 12 }}><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>E-Mail {kunde?.email && <span style={{ color: "#16a34a", fontWeight: 400 }}>(gespeichert)</span>}</label><input value={kundeEmail} onChange={(e) => setKundeEmail(e.target.value)} onBlur={handleEmailBlur} placeholder="E-Mail — wird gespeichert" style={{ width: "100%", padding: "10px 14px", border: `1.5px solid ${kundeEmail ? "#bbf7d0" : "#d1d5db"}`, borderRadius: 10, fontSize: 14, outline: "none", background: kundeEmail ? "#f0fdf4" : "#fff" }} onFocus={(e) => e.target.style.borderColor = "#2563eb"} /></div>
+                <div style={{ marginBottom: 12 }}><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Kunde (SharePoint)</label><KundenDropdown kunden={kunden} value={selectedKunde} onChange={setSelectedKunde} loading={kundenLoading} onRefresh={() => loadKunden(true)} /></div>
+                <div style={{ marginBottom: 12 }}><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>E-Mail {kunde?.email && <span style={{ color: "#16a34a", fontWeight: 400 }}>(gespeichert)</span>}{pipedriveLoading && <span style={{ color: "#2563eb", fontWeight: 400 }}> (Pipedrive sucht...)</span>}</label><input value={kundeEmail} onChange={(e) => setKundeEmail(e.target.value)} onBlur={handleEmailBlur} placeholder={pipedriveLoading ? "Pipedrive wird abgefragt..." : "E-Mail — wird gespeichert"} style={{ width: "100%", padding: "10px 14px", border: `1.5px solid ${pipedriveLoading ? "#93c5fd" : kundeEmail ? "#bbf7d0" : "#d1d5db"}`, borderRadius: 10, fontSize: 14, outline: "none", background: pipedriveLoading ? "#eff6ff" : kundeEmail ? "#f0fdf4" : "#fff" }} onFocus={(e) => e.target.style.borderColor = "#2563eb"} /></div>
                 <div style={{ marginBottom: 12 }}><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Weitere Empfänger <span style={{ color: "#94a3b8", fontWeight: 400 }}>(optional, kommagetrennt)</span></label><input value={extraEmails} onChange={(e) => setExtraEmails(e.target.value)} placeholder="z.B. max@firma.de, anna@firma.de" style={{ width: "100%", padding: "10px 14px", border: `1.5px solid ${extraEmails.trim() ? "#93c5fd" : "#d1d5db"}`, borderRadius: 10, fontSize: 14, outline: "none", background: extraEmails.trim() ? "#eff6ff" : "#fff" }} onFocus={(e) => e.target.style.borderColor = "#2563eb"} /></div>
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                   <div><label style={{ display: "block", fontSize: 12, fontWeight: 600, color: "#475569", marginBottom: 6 }}>Gewerk</label><input value={gewerk} onChange={(e) => setGewerk(e.target.value)} placeholder="z.B. Gebäudereinigung" style={{ width: "100%", padding: "10px 14px", border: "1.5px solid #d1d5db", borderRadius: 10, fontSize: 14, outline: "none" }} /></div>
@@ -1041,10 +1161,10 @@ export default function App() {
         )}
 
         {/* ===== JOBS TAB ===== */}
-        {activeTab === "jobs" && <JobsTab jobs={jobs} onRefresh={loadJobs} onSendReminder={handleSendReminder} />}
+        {activeTab === "jobs" && <JobsTab jobs={jobs} onRefresh={() => { loadJobs(); loadReplyStatuses(); }} onSendReminder={handleSendReminder} replyStatuses={replyStatuses} onCheckReply={async (jobId) => { try { await api.checkReply(jobId); loadJobs(); loadReplyStatuses(); } catch (e) { showToast("Fehler", e.message, true); } }} onMarkReplied={async (jobId) => { try { await api.markReplied(jobId); loadJobs(); loadReplyStatuses(); } catch (e) { showToast("Fehler", e.message, true); } }} />}
 
         {/* ===== KUNDEN TAB ===== */}
-        {activeTab === "kunden" && <KundenTab kunden={kunden} jobs={jobs} onSendReminder={handleSendReminder} />}
+        {activeTab === "kunden" && <KundenTab kunden={kunden} jobs={jobs} onSendReminder={handleSendReminder} replyStatuses={replyStatuses} />}
 
         {activeTab === "einstellungen" && (
           <div style={{ background: "#fff", borderRadius: 16, padding: 48, textAlign: "center", border: "1px solid #e8edf5" }}>

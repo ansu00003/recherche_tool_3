@@ -242,6 +242,11 @@ def fill_section(section, entry, section_num):
         elif text.startswith("Art und Umfang der Leistung:"):
             fill_leistung(p, entry, section)
 
+        elif not text:
+            # Empty spacer paragraphs within the entry — keep with next
+            # so the entry is not split across pages
+            set_keep_next(p)
+
 
 def fill_leistung(heading_p, entry, section):
     """Fill the 'Art und Umfang der Leistung' field with bullet points.

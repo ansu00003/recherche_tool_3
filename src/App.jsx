@@ -697,7 +697,7 @@ export default function App() {
   const [extraEmails, setExtraEmails] = useState("");
   const [signaturPerson, setSignaturPerson] = useState("Dennis Engel");
   const [isEditing, setIsEditing] = useState(false); const [emailBody, setEmailBody] = useState("");
-  const [emailSubject, setEmailSubject] = useState(""); const [isEditingSubject, setIsEditingSubject] = useState(false);
+  const [emailSubject, setEmailSubject] = useState(""); const [isEditingSubject, setIsEditingSubject] = useState(false); const [subjectManuallyEdited, setSubjectManuallyEdited] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false); const [sending, setSending] = useState(false);
   const [previewId, setPreviewId] = useState(null); const [previewPdfUrl, setPreviewPdfUrl] = useState(null); const [previewPdfName, setPreviewPdfName] = useState(null);
   const [generating, setGenerating] = useState(false);
@@ -766,13 +766,13 @@ export default function App() {
   useEffect(() => { if (!isEditing) { setEmailBody(EMAIL_TEMPLATES[emailTyp](anrede, empfaengerName || "xxx", SIGNATUREN[signaturPerson]?.full || "")); } }, [emailTyp, anrede, empfaengerName, signaturPerson, isEditing]);
 
   useEffect(() => {
-    if (!isEditingSubject) {
+    if (!subjectManuallyEdited) {
       const now = new Date();
       const ds = `${String(now.getDate()).padStart(2,'0')}.${String(now.getMonth()+1).padStart(2,'0')}.${now.getFullYear()}`;
       const prefix = emailTyp === "erste" ? "Erste Recherche" : "Aktuelle Recherche";
       setEmailSubject(`${prefix} ${kunde?.name || ""} ${ds} | KALKU`);
     }
-  }, [emailTyp, kunde, isEditingSubject]);
+  }, [emailTyp, kunde, subjectManuallyEdited]);
 
   const showToast = (msg, sub, err) => { setToast({ msg, sub, err }); setTimeout(() => setToast(null), 4000); };
   const handleVorlageUpload = async (e) => {
@@ -1137,9 +1137,9 @@ export default function App() {
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
                       <strong style={{ color: "#475569", fontSize: 13, flexShrink: 0 }}>Betreff:</strong>
-                      {isEditingSubject ? <input value={emailSubject} onChange={(e) => setEmailSubject(e.target.value)} onBlur={() => setIsEditingSubject(false)} autoFocus style={{ flex: 1, padding: "5px 10px", border: "1.5px solid #2563eb", borderRadius: 8, fontSize: 13, outline: "none", background: "#fffef5" }} />
+                      {isEditingSubject ? <input value={emailSubject} onChange={(e) => { setEmailSubject(e.target.value); setSubjectManuallyEdited(true); }} onBlur={() => setIsEditingSubject(false)} autoFocus style={{ flex: 1, padding: "5px 10px", border: "1.5px solid #2563eb", borderRadius: 8, fontSize: 13, outline: "none", background: "#fffef5" }} />
                         : <span onClick={() => setIsEditingSubject(true)} style={{ fontSize: 13, cursor: "pointer", padding: "5px 10px", borderRadius: 8, border: "1.5px solid transparent", flex: 1 }} title="Klicken zum Bearbeiten">{emailSubject}</span>}
-                      {isEditingSubject ? <button onClick={() => { setIsEditingSubject(false); }} style={{ border: "none", background: "none", cursor: "pointer", color: "#16a34a", fontSize: 11, fontWeight: 600 }}>OK</button>
+                      {isEditingSubject ? <button onClick={() => { setSubjectManuallyEdited(true); setIsEditingSubject(false); }} style={{ border: "none", background: "none", cursor: "pointer", color: "#16a34a", fontSize: 11, fontWeight: 600 }}>OK</button>
                         : <button onClick={() => setIsEditingSubject(true)} style={{ border: "none", background: "none", cursor: "pointer", color: "#94a3b8", fontSize: 11, fontWeight: 600 }}>Bearbeiten</button>}
                     </div>
                     <button onClick={() => setIsEditing(!isEditing)} style={{ border: "none", background: "none", cursor: "pointer", color: "#2563eb", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 4, flexShrink: 0, marginLeft: 12 }}>{isEditing ? <><I.Eye /> Vorschau</> : <><I.Edit /> Text bearbeiten</>}</button>

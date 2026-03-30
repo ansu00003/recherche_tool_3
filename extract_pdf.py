@@ -173,6 +173,50 @@ def extract_fields_from_text(text):
             break
     
     # --- AUSFUEHRUNGSORT ---
+    def normalize_address(val):
+        """Normalize address to: Straße Hausnummer, PLZ Stadt (or PLZ Stadt if no street)."""
+        if not val or val == '—':
+            return val
+        # Split by comma or semicolon into parts
+        parts = [p.strip() for p in re.split(r'[,;]', val) if p.strip()]
+        plz = None
+        city = None
+        street = None
+        remaining = []
+        for part in parts:
+            # Check for PLZ (5-digit number)
+            plz_match = re.match(r'^(\d{5})\s+(.+)$', part)
+            if plz_match and not plz:
+                plz = plz_match.group(1)
+                city = plz_match.group(2).strip()
+                continue
+            # Check for street: ends with house number (digits, optionally with letter suffix)
+            if re.search(r'\d+\s*[a-zA-Z]?\s*$', part) and not re.match(r'^\d{5}$', part):
+                street = part
+                continue
+            # Check if this part is just a standalone PLZ
+            if re.match(r'^\d{5}$', part) and not plz:
+                plz = part
+                continue
+            remaining.append(part)
+        # If no city found yet, use remaining parts
+        if not city and remaining:
+            city = remaining[0]
+            remaining = remaining[1:]
+        # Build result: Straße, PLZ Stadt
+        result_parts = []
+        if street:
+            result_parts.append(street)
+        if plz and city:
+            result_parts.append(f"{plz} {city}")
+        elif plz:
+            result_parts.append(plz)
+        elif city:
+            result_parts.append(city)
+        # Append any leftover parts
+        result_parts.extend(remaining)
+        return ', '.join(result_parts) if result_parts else val
+
     # Helper function to clean extracted location
     def clean_location(val):
         if not val or val == '—':
@@ -235,7 +279,11 @@ def extract_fields_from_text(text):
             cleaned = clean_location(region_match.group(1))
             if cleaned != '—':
                 fields['ausfuehrungsort'] = cleaned
-    
+
+    # Normalize address format: Straße Hausnr, PLZ Stadt
+    if fields['ausfuehrungsort'] != '—':
+        fields['ausfuehrungsort'] = normalize_address(fields['ausfuehrungsort'])
+
     # --- BEGINN / ENDE ---
     # FIRST: Try date range pattern (most reliable for paired dates)
     range_patterns = [

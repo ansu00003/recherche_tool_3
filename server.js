@@ -161,6 +161,39 @@ function extractDate(text, flatText, patterns) {
   return '—';
 }
 
+// Normalize address to: Straße Hausnr, PLZ Stadt (or PLZ Stadt if no street)
+function normalizeAddress(val) {
+  if (!val || val === '—') return val;
+  const parts = val.split(/[,;]/).map(p => p.trim()).filter(Boolean);
+  let plz = null, city = null, street = null;
+  const remaining = [];
+  for (const part of parts) {
+    const plzMatch = part.match(/^(\d{5})\s+(.+)$/);
+    if (plzMatch && !plz) {
+      plz = plzMatch[1];
+      city = plzMatch[2].trim();
+      continue;
+    }
+    if (/\d+\s*[a-zA-Z]?\s*$/.test(part) && !/^\d{5}$/.test(part)) {
+      street = part;
+      continue;
+    }
+    if (/^\d{5}$/.test(part) && !plz) {
+      plz = part;
+      continue;
+    }
+    remaining.push(part);
+  }
+  if (!city && remaining.length) { city = remaining.shift(); }
+  const result = [];
+  if (street) result.push(street);
+  if (plz && city) result.push(`${plz} ${city}`);
+  else if (plz) result.push(plz);
+  else if (city) result.push(city);
+  result.push(...remaining);
+  return result.length ? result.join(', ') : val;
+}
+
 function extractFieldsFromText(rawText) {
   const text = normalizeText(rawText);
   const flatText = flattenText(rawText);
@@ -207,6 +240,8 @@ function extractFieldsFromText(rawText) {
     const cityMatch = flatText.match(/(?:Ort|Stadt)[:\s]*([A-Za-zäöüÄÖÜß\s\-]+)/i);
     if (cityMatch) ausfuehrungsort = cityMatch[1].trim();
   }
+  // Normalize address format: Straße Hausnr, PLZ Stadt
+  if (ausfuehrungsort !== '—') ausfuehrungsort = normalizeAddress(ausfuehrungsort);
 
   // === BEGINN / ENDE ===
   let beginn = '—', ende = '—';
@@ -312,7 +347,7 @@ Gib NUR ein valides JSON-Objekt zurück mit diesen Feldern:
 - titel: Titel der Ausschreibung
 - dtad_id: DTAD-ID oder Referenznummer (nur Zahlen/Buchstaben)
 - abgabetermin: Frist für Angebotsabgabe (Format: TT.MM.JJJJ)
-- ausfuehrungsort: Ort der Leistung (Stadt, PLZ oder Region)
+- ausfuehrungsort: Ort der Leistung, Format: "Straße Hausnr, PLZ Stadt" (z.B. "Berliner Promenade 15, 66111 Saarbrücken"). Ohne Straße nur "PLZ Stadt".
 - beginn: Startdatum der Ausführung (Format: TT.MM.JJJJ)
 - ende: Enddatum der Ausführung (Format: TT.MM.JJJJ)
 - leistung: Nur die konkreten Bauleistungen/Arbeiten als Stichpunkte (max 500 Zeichen).

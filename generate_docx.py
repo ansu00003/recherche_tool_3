@@ -140,6 +140,15 @@ def set_hanging_indent(p, left=144, hanging=144):
     ind.set(f"{{{W}}}hanging", str(hanging))
 
 
+def set_spacing_before(p, twips=480):
+    """Set w:spacing w:before on paragraph. Word suppresses this at page top."""
+    ppr = get_ppr(p)
+    spacing = ppr.find(f"{{{W}}}spacing")
+    if spacing is None:
+        spacing = etree.SubElement(ppr, f"{{{W}}}spacing")
+    spacing.set(f"{{{W}}}before", str(twips))
+
+
 # ============================================================
 # SECTION DETECTION
 # ============================================================
@@ -250,8 +259,9 @@ def fill_section(section, entry, section_num):
 
 def fill_leistung(heading_p, entry, section):
     """Fill the 'Art und Umfang der Leistung' field with bullet points.
-    
-    All paragraphs (heading + bullets except last) get keepNext to keep entry together.
+
+    The heading gets keepNext so it stays with the first bullet.
+    Bullets themselves do NOT get keepNext — they flow naturally across pages.
     """
     leistung = entry.get("leistung", DASH)
     if not leistung or leistung == DASH:
@@ -292,22 +302,18 @@ def fill_leistung(heading_p, entry, section):
     heading_ppr = heading_p.find(f"{{{W}}}pPr")
 
     # Insert each bullet as its own paragraph
-    # All bullets except the last one get keepNext
+    # Bullets do NOT get keepNext — they flow naturally across pages.
+    # The heading already has keepNext so it stays with the first bullet.
     for idx, line in enumerate(lines):
         bullet_text = line if line.startswith("- ") else f"- {line}"
         new_p = make_paragraph(heading_ppr)
 
-        # Clear any inherited keepNext first
+        # Clear any inherited keepNext
         new_ppr = new_p.find(f"{{{W}}}pPr")
         if new_ppr is not None:
             kn = new_ppr.find(f"{{{W}}}keepNext")
             if kn is not None:
                 new_ppr.remove(kn)
-
-        # Add keepNext to all bullets EXCEPT the last one
-        # (last bullet doesn't need to keep with anything - allows page break after entry)
-        if idx < len(lines) - 1:
-            set_keep_next(new_p)
 
         # Add hanging indent for bullets
         set_hanging_indent(new_p)
@@ -319,15 +325,8 @@ def fill_leistung(heading_p, entry, section):
         insert_after.addnext(new_p)
         insert_after = new_p
     
-    # ADD: Empty spacer paragraph AFTER the last bullet (gap before next entry)
-    spacer_after_bullets = make_paragraph(heading_ppr)
-    # Clear any inherited keepNext from spacer
-    spacer_ppr = spacer_after_bullets.find(f"{{{W}}}pPr")
-    if spacer_ppr is not None:
-        kn = spacer_ppr.find(f"{{{W}}}keepNext")
-        if kn is not None:
-            spacer_ppr.remove(kn)
-    insert_after.addnext(spacer_after_bullets)
+    # No spacer after bullets — spacing is handled by spacing-before on the
+    # next entry's title (set by normalize_entry_spacing).
 
 
 def split_leistung_to_bullets(leistung):
@@ -432,11 +431,8 @@ def create_extra_sections(body, sections, entries, num_existing):
         section_num = i + 1
         new_paras = []
 
-        # 1. Empty paragraph BEFORE the title
-        spacer_before_title = make_paragraph(normal_ppr)
-        new_paras.append(spacer_before_title)
-
         # Title line (bold) - keepNext to stay with following content
+        # spacing-before is set by normalize_entry_spacing (suppressed at page top)
         titel = entry.get("titel", DASH)
         title_p = make_paragraph(normal_ppr)
         if bold_ref is not None:
@@ -481,7 +477,7 @@ def create_extra_sections(body, sections, entries, num_existing):
         leistung_heading.append(make_run_with_rpr(normal_ref, "Art und Umfang der Leistung:"))
         new_paras.append(leistung_heading)
 
-        # Leistung bullet points - all except last get keepNext
+        # Leistung bullet points - NO keepNext (flow naturally across pages)
         leistung = entry.get("leistung", DASH)
         lines = split_leistung_to_bullets(leistung)
         if lines:
@@ -494,23 +490,12 @@ def create_extra_sections(body, sections, entries, num_existing):
                     kn = bullet_ppr.find(f"{{{W}}}keepNext")
                     if kn is not None:
                         bullet_ppr.remove(kn)
-                # Add keepNext to all bullets EXCEPT the last one
-                if idx < len(lines) - 1:
-                    set_keep_next(bullet_p)
                 set_hanging_indent(bullet_p)
                 bullet_p.append(make_run_with_rpr(normal_ref, bullet_text))
                 new_paras.append(bullet_p)
 
-        # 3. ALWAYS add spacer after bullets (gap before next entry)
-        # This ensures proper spacing between entries
-        spacer_after_bullets = make_paragraph(normal_ppr)
-        # Clear any inherited keepNext from spacer (allows page break between entries)
-        spacer_ppr = spacer_after_bullets.find(f"{{{W}}}pPr")
-        if spacer_ppr is not None:
-            kn = spacer_ppr.find(f"{{{W}}}keepNext")
-            if kn is not None:
-                spacer_ppr.remove(kn)
-        new_paras.append(spacer_after_bullets)
+        # No spacer after bullets — spacing is handled by spacing-before on
+        # the next entry's title (set by normalize_entry_spacing).
 
         # Insert all new paragraphs into the document body
         for np in new_paras:
@@ -523,10 +508,12 @@ def create_extra_sections(body, sections, entries, num_existing):
 # ============================================================
 
 def normalize_entry_spacing(body):
-    """Ensure exactly 2 blank paragraphs before every section title (except the first).
+    """Set spacing-before on every section title (except the first) and remove
+    blank spacer paragraphs between entries.
 
-    Runs repeatedly until no more adjustments are needed, so any number of
-    existing blank lines (1, 3, 4, ...) will be normalized to exactly 2.
+    Uses w:spacing w:before instead of blank paragraphs. Word automatically
+    suppresses spacing-before at the top of a page, so entries that land on
+    a new page won't have unnecessary whitespace above them.
     """
     section_re = re.compile(r"^\d+\.\s+\S")      # "1. Something"
     date_skip_re = re.compile(
@@ -553,35 +540,23 @@ def normalize_entry_spacing(body):
                     break
                 j -= 1
 
-            num_blanks = (i - 1) - j   # blank paragraphs between content and this title
-
-            # Skip if already correct, or if title is at the very top (j < 0)
-            if j < 0 or num_blanks == 2:
+            if j < 0:
                 continue
 
-            # Remove all existing blank paragraphs before this title
-            for k in range(j + 1, i):
-                bp = all_paras[k]
-                parent = bp.getparent()
-                if parent is not None:
-                    parent.remove(bp)
+            num_blanks = (i - 1) - j   # blank paragraphs between content and this title
 
-            # Insert exactly 2 blank paragraphs after the last content para
-            ref_p = all_paras[j]
-            ref_ppr = ref_p.find(f"{{{W}}}pPr")
-            insert_after = ref_p
-            for _ in range(2):
-                spacer = make_paragraph(ref_ppr)
-                sp_ppr = spacer.find(f"{{{W}}}pPr")
-                if sp_ppr is not None:
-                    kn = sp_ppr.find(f"{{{W}}}keepNext")
-                    if kn is not None:
-                        sp_ppr.remove(kn)
-                insert_after.addnext(spacer)
-                insert_after = spacer
+            # Set spacing-before on title (≈2 blank lines, suppressed at page top)
+            set_spacing_before(p, 480)
 
-            adjusted = True
-            break   # Restart scan — indices changed
+            # Remove ALL blank paragraphs before this title
+            if num_blanks > 0:
+                for k in range(j + 1, i):
+                    bp = all_paras[k]
+                    parent = bp.getparent()
+                    if parent is not None:
+                        parent.remove(bp)
+                adjusted = True
+                break   # Restart scan — indices changed
 
         if not adjusted:
             break
